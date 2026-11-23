@@ -1,4 +1,5 @@
 > **Обновление v2.2:** фото из SMS/писем + LLM-сегментация. Инструкция: [README_MULTIMODAL_RU.md](README_MULTIMODAL_RU.md).
+> **Сегментация документа:** иерархия зон → абзацев → предложений, offsets и необязательные LLM-смысловые блоки: [SEGMENTATION_RU.md](SEGMENTATION_RU.md).
 
 > **Обновление конфигурации:** в `.env` используется единый набор `API_KEY`, `API_URL`, `MODEL` для Qwen. LLM-запросы выполняются официальной библиотекой `openai` через OpenAI-compatible API.
 

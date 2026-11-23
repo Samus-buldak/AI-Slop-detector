@@ -5,6 +5,7 @@ import math
 import re
 
 from src.segmentation.segments import FORWARD_HEADER, KINDS, is_quote_line, is_reply_header
+from src.features.lexical_evidence import lexical_zone_features
 
 CONTEXT_NAMES = (
     'log_document_words', 'log_body_words', 'log_subject_words',
@@ -14,6 +15,11 @@ CONTEXT_NAMES = (
     'bullet_line_fraction', 'url_count', 'quote_line_fraction',
     'has_reply_marker', 'has_forward_marker', 'greeting_present',
     'signature_present', 'subject_present', 'body_present',
+) + tuple(
+    f'{zone}_{field}'
+    for zone in KINDS
+    for field in ('template_marker_rate', 'strong_ai_marker_rate',
+                  'first_person_rate', 'concrete_detail_rate')
 )
 TOKEN_RE = re.compile(r"(?u)\b[\w'-]+\b")
 URL_RE = re.compile(r'\b(?:https?://|www\.)[^\s<>()]+', re.I)
@@ -59,4 +65,8 @@ def context_features(zones: dict[str, str], original_body: str = '') -> dict[str
         float(bool(zones['greeting'].strip())), float(bool(zones['signature'].strip())),
         float(bool(zones['subject'].strip())), float(bool(zones['body'].strip())),
     )
-    return dict(zip(CONTEXT_NAMES, result))
+    features = dict(zip(CONTEXT_NAMES[:len(result)], result))
+    for zone in KINDS:
+        features.update({f'{zone}_{name}': value
+                         for name, value in lexical_zone_features(zones[zone]).items()})
+    return features

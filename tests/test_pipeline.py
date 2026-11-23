@@ -148,3 +148,27 @@ def test_semantic_payload_sends_each_email_fragment_as_one_line(monkeypatch):
 
     assert asyncio.run(run()) == [0.5]
     assert seen == [{'i': 0, 'kind': 'body', 'text': 'first line second line third'}]
+
+
+def test_strict_embedding_mode_raises_with_http_details_instead_of_returning_none(monkeypatch):
+    monkeypatch.setattr(api, 'API_KEY', 'test-key')
+    monkeypatch.setattr(api, 'API_URL', 'https://mock.invalid/v1')
+
+    def handler(request):
+        return httpx.Response(401, text='invalid API key')
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await api.embedding_many(['non-empty text'], client=client, strict=True)
+
+    with pytest.raises(RuntimeError, match='HTTP 401') as exc:
+        asyncio.run(run())
+    assert 'invalid API key' in str(exc.value)
+
+
+def test_corrupt_cache_row_is_deleted_and_treated_as_miss(tmp_path):
+    db_path = tmp_path / "signals.sqlite3"
+    with api.SignalCache(db_path) as cache:
+        cache.db.execute("INSERT INTO signals(key, value) VALUES (?, ?)", ("broken", "not-json"))
+        assert cache.get("broken") is None
+        assert cache.db.execute("SELECT COUNT(*) FROM signals WHERE key=?", ("broken",)).fetchone()[0] == 0

@@ -65,6 +65,24 @@ def embedding_details(vector, ai_center, human_center):
             'embedding_human_similarity': cosine(vector, human_center)}
 
 
+def legacy_v2_feature_names(*, include_tfidf=False):
+    """Feature order used by the pre-lexical four-zone Qwen v2 trees."""
+    names = []
+    for kind in KINDS:
+        fields = ['present']
+        if include_tfidf:
+            fields.append('tfidf')
+        fields += ['embedding', 'embedding_ai_similarity', 'embedding_human_similarity',
+                   'semantic_llm', 'semantic_available']
+        names.extend(f'{kind}_{field}' for field in fields)
+    names += list(V2_DOC_FIELDS)
+    names += [f'{field}_available' for field in V2_DOC_FIELDS]
+    # The first 21 context inputs retain their historical order. The newer
+    # per-zone lexical signals are absent from these legacy estimators.
+    names += list(CONTEXT_NAMES[:21])
+    return names
+
+
 def v2_feature_names(extra_segments=False):
     names = []
     for kind in KINDS:

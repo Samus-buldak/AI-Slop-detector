@@ -130,14 +130,24 @@ def main():
     if args.command == 'check':
         return
     if args.command == 'train':
-        if '--with-llm' in rest and not args.llm_from_env and os.environ['MODEL'] == 'unused-local-semantic-disabled':
-            parser.error('Use --llm-from-env to activate your original .env chat model; '
-                         'otherwise set LOCAL_LLM_MODEL or --llm-model <loaded-chat-model-id>.')
+        if any(flag in rest for flag in ('--with-llm', '--llm-segmentation')) and not args.llm_from_env and os.environ['MODEL'] == 'unused-local-semantic-disabled':
+            parser.error('A chat model is required for --with-llm / --llm-segmentation. '
+                         'Use --llm-from-env or set LOCAL_LLM_MODEL / --llm-model to a loaded chat model.')
         sys.argv = ['train.py', *rest]
         runpy.run_module('src.core.train', run_name='__main__')
-        saved = json.loads((ROOT / MODEL_FOLDER / 'centroids.json').read_text(encoding='utf-8'))
-        if saved['backend'] != 'api' or saved['model'] != MODEL_ID:
+        model_path = ROOT / MODEL_FOLDER
+        required = ('tree.pkl', 'centroids.json', 'thresholds.json', 'test_metrics.json')
+        missing = [name for name in required if not (model_path / name).is_file()]
+        if missing:
+            raise RuntimeError('Training finished without required model artifacts: ' + ', '.join(missing))
+        saved = json.loads((model_path / 'centroids.json').read_text(encoding='utf-8'))
+        thresholds = json.loads((model_path / 'thresholds.json').read_text(encoding='utf-8'))
+        if saved.get('backend') != 'api' or saved.get('model') != MODEL_ID:
             raise RuntimeError('Training did not produce Qwen embedding centroids.')
+        if thresholds.get('llm_segmentation') != ('--llm-segmentation' in rest):
+            raise RuntimeError('Training artifact does not match requested LLM segmentation mode.')
+        if thresholds.get('with_llm_trained') != ('--with-llm' in rest):
+            raise RuntimeError('Training artifact does not match requested chat-scoring mode.')
     else:
         path = ROOT / MODEL_FOLDER / 'centroids.json'
         if not path.exists():

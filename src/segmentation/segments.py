@@ -10,6 +10,8 @@ import re
 from email import policy
 from html.parser import HTMLParser
 
+RULES_VERSION = 'rules-v2-inline-boundaries'
+
 KINDS = ('subject', 'greeting', 'body', 'signature')
 GREETING = re.compile(
     r'^(?:hi\b|hey\b|hello\b|dear\b|good (?:morning|evening|afternoon)\b|'
@@ -19,6 +21,23 @@ SIGNOFF = re.compile(
     r'best regards\b|kind regards\b|warm regards\b|regards\b|sincerely\b|'
     r'cheers\b|best wishes\b|thanks(?:\s+(?:and|&amp;)\s+regards)?\s*[,!]*$|'
     r'отправлено с (?:моего|iphone|ipad|android)\b|sent from my\b)', re.I)
+_INLINE_GREETING = re.compile(
+    r'^\s*(?:'
+    r'(?:hi|hey|hello|dear)\b[^.!?\n]{0,100}?[,!:]|'
+    r'good\s+(?:morning|afternoon|evening)\b[^.!?\n]{0,100}?[,!:]|'
+    r'здравствуйте\b[^.!?\n]{0,100}?[,!:]|'
+    r'добр(?:ый\s+(?:день|вечер)|ое\s+утро|ой\s+ночи)\b[^.!?\n]{0,100}?[,!:]|'
+    r'(?:привет|хай|уважаем\w*|коллеги)\b[^.!?\n]{0,100}?[,!:]'
+    r')(?=\s|$)', re.I)
+_INLINE_SIGNOFF_TERM = re.compile(
+    r'(?<!\w)(?:best\s+regards|kind\s+regards|warm\s+regards|regards|'
+    r'sincerely|best\s+wishes|cheers|с\s+уважением|с\s+наилучшими(?:\s+пожеланиями)?|'
+    r'всего\s+доброго|thanks|thank\s+you)(?!\w)', re.I)
+_INLINE_SIGNOFF_TAIL = re.compile(
+    r'^(?:best\s+regards|kind\s+regards|warm\s+regards|regards|sincerely|'
+    r'best\s+wishes|cheers|с\s+уважением|с\s+наилучшими(?:\s+пожеланиями)?|'
+    r'всего\s+доброго)(?:\s*[,!:]?\s*[\wА-Яа-яЁё][^\n]{0,120})?$|'
+    r'^(?:thanks|thank\s+you)\s*[,!]\s*[\wА-Яа-яЁё][^\n]{0,120}$', re.I)
 CONTACT = re.compile(r'(?:[\w.+-]+@[\w.-]+\.\w+|\+\d[\d ()-]{6,}|(?:тел|phone|tel)\s*[:.])', re.I)
 FORWARD_HEADER = re.compile(
     r'^(?:-{2,}\s*)?(?:begin )?(?:original message|forwarded message|'
@@ -168,9 +187,144 @@ def owned_lines(body: str) -> list[str]:
     return lines
 
 
+def _inline_signature_start(text: str, *, min_start: int = 0) -> int | None:
+    """Find a final sign-off embedded in a single physical line.
+
+    A phrase such as "best regards" in the middle of a sentence is not a
+    signature. The marker must be the final fragment and must either start
+    the message or follow sentence-ending punctuation.
+    """
+    for match in _INLINE_SIGNOFF_TERM.finditer(text, max(0, min_start)):
+        prefix = text[:match.start()].rstrip()
+        tail = text[match.start():].strip()
+        if prefix and prefix[-1] not in '.!?;':
+            continue
+        if _INLINE_SIGNOFF_TAIL.fullmatch(tail):
+            return match.start()
+    return None
+
+
+def _inline_greeting_end(text: str) -> int | None:
+    match = _INLINE_GREETING.match(text)
+    if not match:
+        return None
+    end = match.end()
+    # In greetings such as "Здравствуйте, коллеги!" or "Hello, everyone!"
+    # the first comma is not the end of the salutation. Extend only for a
+    # small, explicit recipient vocabulary so body prose is not swallowed.
+    if match.group(0).rstrip().endswith(','):
+        recipient_pattern = (
+            r'\s*(?:коллеги(?:\s+и\s+друзья)?|друзья|команда|всем|все|'
+            r'партнёры|партнеры|everyone|team|folks|guys|'
+            r'ladies\s+and\s+gentlemen|all)\s*[.!?]'
+        )
+        recipient = re.match(recipient_pattern, text[end:], re.I)
+        if recipient:
+            end += recipient.end()
+    return end
+
+
+def _single_line_sentence_ends(text: str, start: int, end: int) -> list[int]:
+    """Find conservative sentence/heading boundaries in a one-line message."""
+    endings = '.!?。！？:'
+    closing = '»”’\'\")]}'
+    abbreviations = ('mr.', 'mrs.', 'ms.', 'dr.', 'prof.', 'e.g.', 'i.e.',
+                     'etc.', 'vs.', 'г.', 'ул.', 'д.', 'стр.', 'т.д.', 'т.п.', 'им.')
+    result = []
+    i = start
+    while i < end:
+        if text[i] not in endings:
+            i += 1
+            continue
+        if text[i] == '.' and i > start and i + 1 < end and text[i - 1].isdigit() and text[i + 1].isdigit():
+            i += 1
+            continue
+        punct_end = i + 1
+        while punct_end < end and text[punct_end] in '.!?。！？':
+            punct_end += 1
+        while punct_end < end and text[punct_end] in closing:
+            punct_end += 1
+        if punct_end >= end or not text[punct_end].isspace():
+            i = punct_end
+            continue
+        left = text[max(start, i - 18):i + 1].casefold()
+        token_start = max(text.rfind(' ', start, i), text.rfind('\t', start, i)) + 1
+        token = text[token_start:i + 1].casefold()
+        if text[i] == '.' and (token in abbreviations or
+                               re.fullmatch(r'[a-zа-яё]\.', token, flags=re.I) or
+                               any(left.endswith(abbr) for abbr in abbreviations)):
+            i = punct_end
+            continue
+        # A colon in a time, URL, or key:value pair is not a sentence break.
+        if text[i] == ':' and i > start and text[i - 1].isdigit():
+            i += 1
+            continue
+        result.append(punct_end)
+        i = punct_end
+        while i < end and text[i].isspace():
+            i += 1
+    return result
+
+
+def segmentation_units(body: str) -> tuple[list[str], list[str]]:
+    """Return exact text units plus their original separators for LLM indexing.
+
+    The normal case is one unit per physical line. For a one-line email only,
+    clear greeting/sign-off boundaries are exposed as additional units. The
+    separators are retained separately, so applying model boundaries never
+    inserts new characters or rewrites the source text.
+    """
+    lines = owned_lines(body)
+    if len(lines) != 1:
+        return lines, ['\n'] * max(0, len(lines) - 1)
+
+    text = lines[0]
+    greeting_end = _inline_greeting_end(text)
+    signature_start = _inline_signature_start(text, min_start=greeting_end or 0)
+    body_start = greeting_end or 0
+    body_end = signature_start if signature_start is not None else len(text)
+    cuts = {cut for cut in (greeting_end, signature_start)
+            if cut is not None and 0 < cut < len(text)}
+    # Sentence/heading units give the LLM useful boundaries even when a user
+    # pasted the entire email into a single textbox line.
+    cuts.update(cut for cut in _single_line_sentence_ends(text, body_start, body_end)
+                if 0 < cut < len(text))
+    cuts = sorted(cuts)
+    if not cuts:
+        return lines, []
+
+    raw_ranges = list(zip([0, *cuts], [*cuts, len(text)]))
+    spans = []
+    for start, end in raw_ranges:
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if start < end:
+            spans.append((start, end))
+    units = [text[start:end] for start, end in spans]
+    separators = [text[left[1]:right[0]] for left, right in zip(spans, spans[1:])]
+    return (units, separators) if units else (lines, [])
+
+
 def split_email(subject: str, body: str) -> dict[str, str]:
     lines = owned_lines(body)
     greeting = signature = ''
+    # A pasted message often arrives as one long line. Detect only unambiguous
+    # leading salutations and final sign-offs; preserve every source character
+    # between the resulting zones (apart from trimmed zone-edge whitespace).
+    if len(lines) == 1:
+        line = lines[0]
+        greeting_end = _inline_greeting_end(line)
+        signature_start = _inline_signature_start(line, min_start=greeting_end or 0)
+        greeting = line[:greeting_end].strip() if greeting_end is not None else ''
+        body_end = signature_start if signature_start is not None else len(line)
+        body_start = greeting_end if greeting_end is not None else 0
+        message = line[body_start:body_end].strip()
+        signature = line[signature_start:].strip() if signature_start is not None else ''
+        if greeting or signature:
+            return {'subject': subject.strip(), 'greeting': greeting,
+                    'body': message, 'signature': signature}
     if lines:
         # Some emails begin with a name / salutation on a single line.
         first = lines[0].strip()

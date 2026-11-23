@@ -7,8 +7,11 @@ import argparse
 import asyncio
 import csv
 import json
+import os
 import pickle
 import re
+import shutil
+import tempfile
 import time
 from collections import Counter
 from pathlib import Path
@@ -16,7 +19,7 @@ from pathlib import Path
 import numpy as np
 from sklearn.metrics import (balanced_accuracy_score, confusion_matrix, precision_score,
                              recall_score, roc_auc_score)
-from sklearn.tree import DecisionTreeClassifier, export_text
+from sklearn.tree import export_text
 
 from src.api.api import SignalCache
 from src.features.embedding_pipeline import embedding_vectors, fit_document_projection
@@ -25,7 +28,9 @@ from src.utils.config import (API_KEY, DATA_DIR, MODEL_DIR, SEMANTIC_API_KEY,
 from src.core.scoring import (final_score_v2, full_semantic_coverage, v2_feature_names)
 from src.segmentation.segments import document_text, parse_eml, split_email
 from src.core.signals_v2 import collect_rows
+from src.models.decision_tree import train_tuned_tree, tree_feature_importance
 from src.segmentation.segmentation_llm import PROMPT_VERSION, segment_many
+from src.segmentation.segments import RULES_VERSION
 from src.segmentation.qwen_zones import QWEN_KINDS, expand_qwen_zones
 
 
@@ -65,20 +70,20 @@ def load_data(csv_path=None):
         if not rows:
             raise RuntimeError('Нет размеченных писем. Укажи --csv data/demo_synthetic.csv для '
                                'ДЕМОНСТРАЦИИ или добавь data/dataset.csv / data/human/*.eml + data/ai/*.eml')
-    # Убираем точные и очевидные нормализованные дубликаты ДО разделения.
-    unique = {}
-    contradictory = 0
+    # Deduplicate before splitting to prevent train/test leakage. A fingerprint
+    # seen with BOTH labels is excluded completely, even if a third duplicate
+    # appears later with either label.
+    grouped = {}
     for subject, body, label in rows:
         fingerprint = re.sub(r'\s+', ' ', subject + '\n' + body).strip().casefold()
-        if fingerprint in unique:
-            if unique[fingerprint][2] != label:
-                contradictory += 1
-                unique.pop(fingerprint)
-            continue
-        unique[fingerprint] = (subject, body, label)
-    rows = list(unique.values())
+        if fingerprint not in grouped:
+            grouped[fingerprint] = {'row': (subject, body, label), 'labels': {label}}
+        else:
+            grouped[fingerprint]['labels'].add(label)
+    contradictory = sum(len(item['labels']) > 1 for item in grouped.values())
+    rows = [item['row'] for item in grouped.values() if len(item['labels']) == 1]
     if contradictory:
-        print(f'[!] найдено {contradictory} противоречивых дубликатов; исключены')
+        print(f'[!] найдено {contradictory} групп с противоречивыми метками; исключены целиком')
     labels = Counter(x[2] for x in rows)
     print(f'[data] после дедупликации: {len(rows)} (human={labels[0]}, ai={labels[1]})')
     if min(labels[0], labels[1]) < 20:
@@ -88,6 +93,8 @@ def load_data(csv_path=None):
 
 
 def split_rows(rows, seed, stack_limit, calib_limit, test_limit):
+    if min(stack_limit, calib_limit, test_limit) < 1:
+        raise ValueError('Размеры stack/calib/test должны быть положительными числами')
     rng = np.random.default_rng(seed)
     split = {'base': [], 'stack': [], 'calib': [], 'test': []}
     for label in (0, 1):
@@ -115,13 +122,13 @@ def normalize_center(vectors):
     return (avg / norm).tolist() if norm > 0 else None
 
 
-def fit_centroids(rows, cache, per_class, llm_segment=False):
+def fit_centroids(rows, cache, per_class, llm_segment=False, *, seed=42):
     """Per-zone + full-document local Qwen centroids, fit ONLY on base split."""
     from src.utils.config import EMBED_MODEL
-    probe = embedding_vectors(['embedding probe'], cache=cache)
+    probe = embedding_vectors(['embedding probe'], cache=cache, strict=True)
     if not probe[0]:
         raise RuntimeError('No real /embeddings response. Check LM Studio/Qwen; no fake vectors used.')
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(seed)
     subset = []
     for label in (0, 1):
         candidates = [row for row in rows if row[2] == label]
@@ -130,29 +137,36 @@ def fit_centroids(rows, cache, per_class, llm_segment=False):
     if llm_segment:
         enhanced = asyncio.run(segment_many([(a, b) for a, b, _ in subset], cache=cache, verbose=True, semantic_blocks=True))
         segs = [z for z, _ in enhanced]
-        print(f'[segmentation:base] LLM used: {sum(used for _, used in enhanced)}/{len(enhanced)}')
+        used_count = sum(used for _, used in enhanced)
+        print(f'[segmentation:base] LLM used: {used_count}/{len(enhanced)}')
+        if used_count != len(enhanced):
+            raise RuntimeError(f'LLM segmentation failed for {len(enhanced) - used_count}/{len(enhanced)} base examples; training stopped to avoid mixed segmentation modes.')
     else:
         segs = [split_email(subject, body) for subject, body, _ in subset]
     segs = [expand_qwen_zones(zones) for zones in segs]
     zone_keys = list(dict.fromkeys((kind, zones[kind]) for zones in segs
                                    for kind in QWEN_KINDS if zones[kind].strip()))
     docs = [document_text(zone) for zone in segs]
-    vectors = embedding_vectors([text for _, text in zone_keys] + docs,
-                                cache=cache, verbose=True)
-    zone_embeddings = dict(zip(zone_keys, vectors[:len(zone_keys)]))
-    document_vectors = vectors[len(zone_keys):]
+    all_vectors = embedding_vectors([text for _, text in zone_keys] + docs,
+                                    cache=cache, verbose=True, strict=True)
+    expected_dim = len(probe[0])
+    if any(vector is None for vector in all_vectors):
+        raise RuntimeError('Qwen returned a missing embedding for a non-empty training input')
+    if any(len(vector) != expected_dim for vector in all_vectors):
+        raise RuntimeError('Embedding dimensions are inconsistent across training batches')
+    zone_embeddings = dict(zip(zone_keys, all_vectors[:len(zone_keys)]))
+    document_vectors = all_vectors[len(zone_keys):]
     grouped = {}
     for row, zones, vec in zip(subset, segs, document_vectors):
-        if vec is not None:
-            grouped.setdefault(('document', row[2]), []).append(vec)
+        grouped.setdefault(('document', row[2]), []).append(vec)
         for kind in QWEN_KINDS:
             val = zone_embeddings.get((kind, zones[kind]))
             if val is not None:
                 grouped.setdefault((kind, row[2]), []).append(val)
     centers = {}
-    for (kind, label), vectors in grouped.items():
-        if len(vectors) >= 3:
-            center = normalize_center(vectors)
+    for (kind, label), class_vectors in grouped.items():
+        if len(class_vectors) >= 3:
+            center = normalize_center(class_vectors)
             if center is not None:
                 centers[f'{kind}_{label}'] = center
     if not all(f'document_{label}' in centers for label in (0, 1)):
@@ -165,14 +179,18 @@ def fit_centroids(rows, cache, per_class, llm_segment=False):
 
 
 def score_rows(rows, centroids, cache, use_sem, llm_segment=False):
-    """Legacy helper name kept for tests / callers, using the v2 feature engine."""
+    """Feature extraction for training; API failures must never become fake zeros."""
     enhanced = (asyncio.run(segment_many([(a, b) for a, b, _ in rows], cache=cache, verbose=True, semantic_blocks=True))
                 if llm_segment else None)
     if enhanced is not None:
-        print(f'[segmentation] LLM used: {sum(ok for _, ok in enhanced)}/{len(enhanced)}')
+        used_count = sum(ok for _, ok in enhanced)
+        print(f'[segmentation] LLM used: {used_count}/{len(enhanced)}')
+        if used_count != len(enhanced):
+            raise RuntimeError(f'LLM segmentation failed for {len(enhanced) - used_count}/{len(enhanced)} examples; training stopped to prevent inconsistent features.')
     return collect_rows(rows, centroids, cache, with_llm=use_sem,
                         verbose=True, zone_overrides=[z for z, _ in enhanced] if enhanced else None,
-                        extra_segments=True)
+                        extra_segments=True, strict_embeddings=True,
+                        strict_semantic=use_sem)
 
 
 def best_cut(labels, scores):
@@ -272,12 +290,65 @@ def evaluate(rows, trees, engine):
     return report
 
 
+def save_artifacts(model_dir: Path, trees, centroids, thresholds, metrics):
+    """Publish a complete model set and restore the previous set on failure.
+
+    Each file is replaced atomically. A staging directory holds both the new
+    files and backups, so an exception during publication restores the previous
+    set instead of leaving mixed tree weights and JSON metadata.
+    """
+    model_dir.mkdir(parents=True, exist_ok=True)
+    names = ('tree.pkl', 'centroids.json', 'thresholds.json', 'test_metrics.json')
+    payloads = {
+        'centroids.json': centroids,
+        'thresholds.json': thresholds,
+        'test_metrics.json': metrics,
+    }
+    with tempfile.TemporaryDirectory(prefix='.training-stage-', dir=model_dir) as raw_stage:
+        stage = Path(raw_stage)
+        staged = {}
+        for name in names:
+            path = stage / name
+            if name == 'tree.pkl':
+                with path.open('wb') as handle:
+                    pickle.dump(trees, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            else:
+                path.write_text(json.dumps(payloads[name], indent=2, ensure_ascii=False,
+                                           allow_nan=False), encoding='utf-8')
+            staged[name] = path
+
+        backups = {}
+        for name in names:
+            destination = model_dir / name
+            if destination.is_file():
+                backup = stage / (name + '.previous')
+                shutil.copy2(destination, backup)
+                backups[name] = backup
+
+        published = []
+        try:
+            for name in names:
+                os.replace(staged[name], model_dir / name)
+                published.append(name)
+        except Exception:
+            for name in published:
+                destination = model_dir / name
+                previous = backups.get(name)
+                if previous is not None and previous.exists():
+                    os.replace(previous, destination)
+                else:
+                    destination.unlink(missing_ok=True)
+            raise
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--csv', type=Path, help='CSV; default data/dataset.csv')
     parser.add_argument('--no-semantic', action='store_true', help='alias for default: do not use a chat LLM')
     parser.add_argument('--llm-segmentation', action='store_true',
-                        help='LLM segments own lines in every training/evaluation stage (requires --with-llm)')
+                        help='Use chat LLM to segment every email in every training/evaluation stage')
     parser.add_argument('--with-llm', action='store_true',
                         help='include independently scored chat-LLM features in a second tree')
     parser.add_argument('--centroid-per-class', type=int, default=120)
@@ -286,12 +357,16 @@ def main():
     parser.add_argument('--test-per-class', type=int, default=80)
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
-    if args.llm_segmentation and not args.with_llm:
-        parser.error('--llm-segmentation requires --with-llm')
-    if args.with_llm and args.no_semantic:
-        parser.error('--with-llm cannot be combined with --no-semantic')
+    if args.no_semantic and (args.with_llm or args.llm_segmentation):
+        parser.error('--no-semantic cannot be combined with --with-llm or --llm-segmentation')
+    if args.centroid_per_class < 3:
+        parser.error('--centroid-per-class must be at least 3')
+    if min(args.stack_per_class, args.calib_per_class, args.test_per_class) < 1:
+        parser.error('stack/calib/test per-class limits must be positive')
     if not API_KEY:
-        parser.error('Qwen endpoint is not configured; use python -m src.api.local_qwen train')
+        parser.error('Qwen embedding API key/endpoint is not configured; use python -m src.api.local_qwen train')
+    if args.llm_segmentation and not SEMANTIC_API_KEY:
+        parser.error('--llm-segmentation requires a chat model. Use --llm-from-env or --llm-model with local_qwen.')
     t0 = time.perf_counter()
     rows = load_data(args.csv)
     parts = split_rows(rows, args.seed, args.stack_per_class, args.calib_per_class, args.test_per_class)
@@ -301,25 +376,30 @@ def main():
     if args.with_llm and not use_sem:
         parser.error('No chat LLM API key configured for --with-llm')
     with SignalCache(MODEL_DIR / 'cache.sqlite3') as cache:
-        centroids = fit_centroids(parts['base'], cache, max(3, args.centroid_per_class), llm_segment=args.llm_segmentation)
+        centroids = fit_centroids(parts['base'], cache, max(3, args.centroid_per_class),
+                                  llm_segment=args.llm_segmentation, seed=args.seed)
         print('[stack] fitting no-LLM tree on stack-only examples')
         stack = score_rows(parts['stack'], centroids, cache, use_sem=use_sem, llm_segment=args.llm_segmentation)
         x_stack = np.asarray([r['features_no_llm'] for r in stack])
         y_stack = np.asarray([r['label'] for r in stack])
-        def new_tree():
-            return DecisionTreeClassifier(max_depth=4, min_samples_leaf=max(5, len(stack) // 50),
-                                          class_weight='balanced', random_state=args.seed)
-        trees = {'no_llm': new_tree().fit(x_stack, y_stack)}
-        print(export_text(trees['no_llm'], feature_names=v2_feature_names(extra_segments=True)))
+        feature_names = v2_feature_names(extra_segments=True)
+        trees = {}
+        tree_reports = {}
+        trees['no_llm'], tree_reports['no_llm'] = train_tuned_tree(x_stack, y_stack, seed=args.seed)
+        if x_stack.shape[1] != len(feature_names):
+            raise RuntimeError(f'Feature mismatch: matrix has {x_stack.shape[1]} columns, names have {len(feature_names)}')
+        print('[tree:no_llm] selected:', tree_reports['no_llm'])
+        print(export_text(trees['no_llm'], feature_names=feature_names))
         if use_sem:
             sem_stack = [r for r in stack if full_semantic_coverage(r['scores'])]
             if len({r['label'] for r in sem_stack}) < 2 or len(sem_stack) < 12:
                 raise RuntimeError('Too few complete chat LLM judgments for with_llm tree. '
                                    'Load a local chat model or omit --with-llm.')
-            trees['with_llm'] = new_tree().fit(
-                np.asarray([r['features_with_llm'] for r in sem_stack]),
-                np.asarray([r['label'] for r in sem_stack]))
+            x_sem = np.asarray([r['features_with_llm'] for r in sem_stack])
+            y_sem = np.asarray([r['label'] for r in sem_stack])
+            trees['with_llm'], tree_reports['with_llm'] = train_tuned_tree(x_sem, y_sem, seed=args.seed)
             print('[stack:with_llm] trained on', len(sem_stack), 'complete judgments')
+            print('[tree:with_llm] selected:', tree_reports['with_llm'])
         print('[calib] choosing cutoffs on independent samples')
         calib = score_rows(parts['calib'], centroids, cache, use_sem=use_sem, llm_segment=args.llm_segmentation)
         segment_cuts = calibrate_segments(calib)
@@ -340,20 +420,15 @@ def main():
                   'embedding_backend': centroids['backend'],
                   'with_llm_trained': bool('with_llm' in trees),
                   'llm_segmentation': bool(args.llm_segmentation),
-                  'segmentation_version': (PROMPT_VERSION if args.llm_segmentation else 'rules'),
-                  'llm_model': (SEMANTIC_MODEL if use_sem else None),
-                  'llm_endpoint': (SEMANTIC_API_URL if use_sem else None),
-                  'feature_names': v2_feature_names(extra_segments=True),
+                  'segmentation_version': (PROMPT_VERSION if args.llm_segmentation else RULES_VERSION),
+                  'llm_model': (SEMANTIC_MODEL if (use_sem or args.llm_segmentation) else None),
+                  'llm_endpoint': (SEMANTIC_API_URL if (use_sem or args.llm_segmentation) else None),
+                  'feature_names': feature_names,
+                  'tree_selection': tree_reports,
+                  'tree_feature_importance': {mode: tree_feature_importance(tree, feature_names)
+                                              for mode, tree in trees.items()},
                   'class_mapping': {'0': 'HUMAN', '1': 'AI'}}
-    tmp = MODEL_DIR / 'tree.pkl.tmp'
-    with tmp.open('wb') as fh:
-        pickle.dump(trees, fh)
-    tmp.replace(MODEL_DIR / 'tree.pkl')
-    for name, obj in (('centroids.json', centroids), ('thresholds.json', thresholds),
-                      ('test_metrics.json', report)):
-        tmp = MODEL_DIR / (name + '.tmp')
-        tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding='utf-8')
-        tmp.replace(MODEL_DIR / name)
+    save_artifacts(MODEL_DIR, trees, centroids, thresholds, report)
     print(f'[done] {time.perf_counter() - t0:.1f} s; models and metrics in {MODEL_DIR}')
     print('[!] Synthetic / source-shifted corpus is NOT evidence of robust real-world AI detection.')
 

@@ -16,7 +16,7 @@ from openai import AsyncOpenAI
 
 from src.api.api import _post
 from llm_client import create_async_client
-from src.utils.config import VISION_API_KEY, VISION_API_URL, VISION_MODEL
+from src.utils.config import API_TIMEOUT, VISION_API_KEY, VISION_API_URL, VISION_MODEL
 
 VISION_PROMPT = 'origin-of-photo-v1'
 IMAGE_WEIGHT = 0.20  # heuristic: not fitted on image-labelled data
@@ -87,7 +87,8 @@ async def assess_images(photos, cache=None, client=None):
             return {'score': None, 'reason': f'Vision API недоступен или модель не поддерживает изображения ({type(exc).__name__})'}
 
     if client is None:
-        async with create_async_client(VISION_API_KEY, VISION_API_URL) as new_client:
+        async with create_async_client(VISION_API_KEY, VISION_API_URL,
+                                       timeout=API_TIMEOUT) as new_client:
             for photo in photos:
                 results.append(await assess_one(photo, new_client))
     elif isinstance(client, AsyncOpenAI):
@@ -96,7 +97,7 @@ async def assess_images(photos, cache=None, client=None):
     else:
         # Compatibility for injected httpx transports in unit tests.
         sdk_client = create_async_client(VISION_API_KEY, VISION_API_URL,
-                                         http_client=client)
+                                         timeout=API_TIMEOUT, http_client=client)
         for photo in photos:
             results.append(await assess_one(photo, sdk_client))
     return results
