@@ -2,19 +2,19 @@
 import json
 import pickle
 
-import analyze
-import server
+from src.core import analyze
+from src.core.scoring import v2_feature_names
+from src.api import server
 
 
 def test_v2_model_loads_without_tfidf_file(monkeypatch, tmp_path):
     (tmp_path / "tree.pkl").write_bytes(pickle.dumps({"no_llm": "dummy-tree"}))
-    (tmp_path / "thresholds.json").write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
+    (tmp_path / "thresholds.json").write_text(json.dumps({"schema_version": 2, "feature_names": v2_feature_names()}), encoding="utf-8")
     (tmp_path / "centroids.json").write_text(json.dumps({"backend": "api"}), encoding="utf-8")
     monkeypatch.setattr(analyze, "MODEL_DIR", tmp_path)
     analyze.load_model.cache_clear()
     try:
-        tfidf, tree, thresholds, centroids = analyze.load_model()
-        assert tfidf is None
+        tree, thresholds, centroids = analyze.load_model()
         assert tree == {"no_llm": "dummy-tree"}
         assert thresholds["schema_version"] == 2
         assert centroids["backend"] == "api"

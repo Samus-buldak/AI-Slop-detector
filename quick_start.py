@@ -10,16 +10,19 @@ import subprocess
 import sys
 from pathlib import Path
 
+from src.api.local_qwen import MODEL_FOLDER
+from src.core.scoring import v2_feature_names
+
 ROOT = Path(__file__).resolve().parent
 PYTHON = sys.executable
-TRAINED = ROOT / 'model_hybrid_qwen' / 'thresholds.json'
+TRAINED = ROOT / MODEL_FOLDER / 'thresholds.json'
 
 
 def ask(prompt, default=''):
     try:
         answer = input(prompt).strip()
     except EOFError:
-        return default
+        raise SystemExit(0)
     return answer or default
 
 
@@ -54,10 +57,15 @@ def configure_env():
     if configured(values):
         print('OK: .env найден, API_KEY, API_URL и MODEL указаны (сам ключ не выводится).')
         return True
-    print('Открой .env в Блокноте, впиши API_KEY, сохрани Ctrl+S и вернись сюда.')
+    print('Открой .env в текстовом редакторе и заполни API_KEY, API_URL и MODEL.')
     if sys.platform == 'win32':
         try:
             subprocess.Popen(['notepad.exe', str(env)], cwd=ROOT)
+        except OSError:
+            pass
+    elif sys.platform == 'darwin':
+        try:
+            subprocess.Popen(['open', '-t', str(env)], cwd=ROOT)
         except OSError:
             pass
     ask('После сохранения .env нажми Enter... ')
@@ -70,7 +78,7 @@ def configure_env():
 
 
 def run_local(*args):
-    cmd = [PYTHON, str(ROOT / 'local_qwen.py'), *args]
+    cmd = [PYTHON, '-m', 'src.api.local_qwen', *args]
     print('\n>>>', ' '.join(x for x in cmd[2:] if x != '--llm-from-env'), flush=True)
     return subprocess.call(cmd, cwd=ROOT)
 
@@ -84,8 +92,10 @@ def is_new_model_ready():
         settings = json.loads(TRAINED.read_text(encoding='utf-8'))
         centroids = json.loads((TRAINED.parent / 'centroids.json').read_text(encoding='utf-8'))
         return (settings.get('schema_version') == 2 and
+                not settings.get('use_tfidf') and
                 settings.get('with_llm_trained') is True and
                 settings.get('llm_segmentation') is True and
+                settings.get('feature_names') == v2_feature_names(extra_segments=True) and
                 centroids.get('backend') == 'api' and
                 centroids.get('model') == 'qwen3-embedding-local')
     except (OSError, ValueError, TypeError):
@@ -93,28 +103,51 @@ def is_new_model_ready():
 
 
 def main():
-    print('\n=== Kirusha AI Detector: запуск ===')
-    if not configure_env():
+    print('\n=== AI Slop Detector: запуск ===')
+    print('1 — анализ с сохранёнными весами')
+    print('2 — обучить модель со всеми 21 зонами и открыть анализ')
+    print('0 — выход')
+    choice = ask('Выбери: ', '1')
+    if choice == '0':
+        return 0
+    if choice not in ('1', '2'):
+        print('Нет такого пункта.')
+        return 2
+    train_new = choice == '2'
+    if train_new and not configure_env():
         return 2
     print('\nПроверяю локальный Qwen (LM Studio, порт 1234)...')
     if run_local('check'):
-        print('\nНе удалось подключиться к Qwen. Запусти LM Studio, включи Local Server')
-        print('на http://127.0.0.1:1234 и загрузи embedding-модель под именем qwen3-embedding-local.')
+        print('Запусти Local Server в LM Studio на порту 1234 и загрузи Qwen3 Embedding 0.6B')
+        print('с идентификатором qwen3-embedding-local. Подробности в START_HERE_RU.txt.')
         return 3
-    if not is_new_model_ready():
-        print('\nНовая гибридная модель ещё не обучена. Потребуются запросы к внешней')
-        print('LLM из .env для сегментации и обучения. Возможно расходование квоты API.')
-        if ask('Начать первичное обучение сейчас? [Д/н]: ', 'д').lower() in ('н', 'n', 'no', 'нет'):
-            print('Чтобы обучить позже, запусти 09_QWEN_ENV_LLM_TRAIN.bat.')
+    if train_new:
+        print('Обучение заменит веса в artifacts/model_hybrid_qwen/.')
+        print('Тексты будут отправлены chat-провайдеру из .env. Возможен расход квоты API.')
+        if ask('Начать обучение? [д/Н]: ', 'н').lower() not in ('д', 'y', 'yes', 'да'):
             return 0
         if run_local('train', '--llm-from-env', '--with-llm', '--llm-segmentation'):
-            print('\nОбучение завершилось с ошибкой — смотри вывод выше. Модель не готова.')
             return 4
         if not is_new_model_ready():
-            print('Обучение не сохранило полноценную with_llm модель.')
+            print('Обучение не сохранило модель с 21 зоной. Проверь вывод выше.')
             return 5
-    print('\nМодель готова. Qwen работает локально; текст/фото в гибридном режиме')
-    print('передаются внешнему провайдеру из .env. Без фото vision не вызывается.')
+    if not all((TRAINED.parent / name).is_file()
+               for name in ('thresholds.json', 'tree.pkl', 'centroids.json')):
+        print('Веса не найдены. Перезапусти меню и выбери обучение.')
+        return 5
+    settings = json.loads(TRAINED.read_text(encoding='utf-8'))
+    extra_zones = settings.get('feature_names') == v2_feature_names(extra_segments=True)
+    print('Модель использует', '21 зону.' if extra_zones else '4 зоны. Для 21 зоны выбери обучение при запуске.')
+    provider_args = []
+    if settings.get('llm_segmentation'):
+        if not configure_env():
+            return 2
+        provider_args = ['--llm-from-env']
+    elif configured(load_config()):
+        print('В .env настроен chat-провайдер. Его включение передаёт ему части писем.')
+        if ask('Включить chat/vision из .env? [д/Н]: ', 'н').lower() in ('д', 'y', 'yes', 'да'):
+            provider_args = ['--llm-from-env']
+    print('\nАнализ готов. Для выхода выбери 0.')
     while True:
         print('\n1 — проверить текст/SMS')
         print('2 — проверить текст + фотографию')
@@ -124,19 +157,19 @@ def main():
         if choice == '0':
             break
         if choice == '1':
-            run_local('text', '--llm-from-env')
+            run_local('text', *provider_args)
         elif choice == '2':
             photo = ask('Путь к фото JPG/PNG/WEBP (можно перетащить файл в окно): ').strip('"')
             if not photo or not Path(photo).is_file():
                 print('Файл не найден — выбери 1 для проверки только текста.')
             else:
-                run_local('text', '--llm-from-env', '--image', photo)
+                run_local('text', *provider_args, '--image', photo)
         elif choice == '3':
             eml = ask('Путь к .eml: ').strip('"')
             if not Path(eml).is_file():
                 print('Файл не найден.')
             else:
-                run_local('analyze', '--llm-from-env', eml)
+                run_local('analyze', *provider_args, eml)
         else:
             print('Нет такого пункта.')
     return 0

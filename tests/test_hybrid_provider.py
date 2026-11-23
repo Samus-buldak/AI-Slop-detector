@@ -5,8 +5,8 @@ import json
 import httpx
 import pytest
 
-import api
-import local_qwen
+from src.api import api
+from src.api import local_qwen
 
 
 def test_routed_embedding_and_semantic_have_distinct_auth_and_endpoints(monkeypatch):

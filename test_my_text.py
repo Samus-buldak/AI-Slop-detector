@@ -15,8 +15,7 @@ import mimetypes
 from email.message import EmailMessage
 from pathlib import Path
 
-from analyze import RU, score_email
-from segments import KINDS
+from src.core.analyze import RU, score_email
 
 
 def get_text(filename: str | None) -> str:
@@ -66,14 +65,13 @@ def main() -> None:
     print("\n--- РЕЗУЛЬТАТ ---")
     print(f"Объём: {len(text.split())} слов")
     print(f"Режим: {result.get('mode', 'нет')}; эмбеддинги: {result.get('embedding_backend', 'нет')}")
-    print(f"{'Сегмент':<17}{'TF-IDF':>9}{'EMBED':>9}{'LLM':>9}{'SCORE':>9}{'ПОРОГ':>9}  Метка")
-    for kind in KINDS:
-        item = result['segments'][kind]
+    print(f"{'Сегмент':<17}{'EMBED':>9}{'LLM':>9}{'SCORE':>9}{'ПОРОГ':>9}  Метка")
+    for kind, item in result['segments'].items():
         if not item['present']:
             print(f"{RU[kind]:<17}(отсутствует)")
             continue
         fmt = lambda key: '—' if item.get(key) is None else f"{item[key]:.3f}"
-        print(f"{RU[kind]:<17}{fmt('tfidf'):>9}{fmt('embedding'):>9}"
+        print(f"{RU[kind]:<17}{fmt('embedding'):>9}"
               f"{fmt('semantic_llm'):>9}{fmt('score'):>9}{fmt('threshold'):>9}  {item['label']}")
     print(f"Дерево решений: {result.get('tree_probability', '—')}")
     photos = result.get('photos', {})
