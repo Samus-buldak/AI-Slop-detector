@@ -8,12 +8,12 @@ import httpx
 import pytest
 from PIL import Image
 
-import analyze
-import api
-import segmentation_llm
-import vision
-from media_images import extract_images
-from segments import split_email
+from src.core import analyze
+from src.api import api
+from src.segmentation import segmentation_llm
+from src.vision import vision
+from src.vision.media_images import extract_images
+from src.segmentation.segments import split_email
 
 
 def png_bytes(color='blue'):
@@ -96,7 +96,7 @@ def test_llm_segmentation_uses_indices_without_rewriting(monkeypatch):
     monkeypatch.setattr(segmentation_llm, 'SEMANTIC_API_KEY', 'unit-test-token')
     monkeypatch.setattr(segmentation_llm, 'SEMANTIC_API_URL', 'https://llm.example/v1')
     monkeypatch.setattr(segmentation_llm, 'SEMANTIC_MODEL', 'test-segmenter')
-    text = 'Good day Pavel\n\nLong message with details.\n\nYour friend, Alex'
+    text = 'Good day Pavel\n\nLong message with details.\nOld text without a quote marker\nNext topic.\n\nYour friend, Alex'
     events = []
 
     def handler(request):
@@ -105,18 +105,20 @@ def test_llm_segmentation_uses_indices_without_rewriting(monkeypatch):
         assert request.headers['authorization'] == 'Bearer unit-test-token'
         data = json.loads(payload['messages'][1]['content'])
         events.append(data)
-        answers = [{'i': d['i'], 'greeting_end': 2, 'signature_start': 4} for d in data]
+        answers = [{'i': d['i'], 'greeting_end': 2, 'signature_start': 6, 'quote_lines': [3], 'block_starts': [4]} for d in data]
         return httpx.Response(200, json={'choices': [{'message': {'content': json.dumps(answers)}}]})
 
     async def run():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            return await segmentation_llm.segment_many([('Title', text)], client=client)
+            return await segmentation_llm.segment_many([('Title', text), ('Title', text)], client=client, semantic_blocks=True)
 
     result = asyncio.run(run())
     zones, llm_used = result[0]
     assert llm_used and len(events) == 1
+    assert result[0] == result[1]
     assert zones['greeting'] == 'Good day Pavel'
-    assert zones['body'] == 'Long message with details.'
+    assert zones['body'] == 'Long message with details.\nNext topic.'
+    assert zones['_semantic_blocks'] == ['Long message with details.', 'Next topic.']
     assert zones['signature'] == 'Your friend, Alex'
     assert zones['subject'] == 'Title'
     assert 'Long message with details.' in text
@@ -132,7 +134,7 @@ def test_bad_segmentation_is_fallback(monkeypatch):
     async def run():
         async with httpx.AsyncClient(transport=httpx.MockTransport(
             lambda request: httpx.Response(200, json={'choices': [{'message': {'content':
-                '[{"i":0,"greeting_end":300,"signature_start":-1}]'}}]}))) as client:
+                '[{"i":0,"greeting_end":2,"signature_start":4,"quote_lines":[999]}]'}}]}))) as client:
             return await segmentation_llm.segment_many([('Subject', text)], client=client)
     zones, used = asyncio.run(run())[0]
     assert not used
@@ -141,7 +143,7 @@ def test_bad_segmentation_is_fallback(monkeypatch):
 
 def test_combination_in_inference_no_image_does_not_call_vision(monkeypatch, tmp_path):
     monkeypatch.setattr(analyze, 'MODEL_DIR', tmp_path)
-    monkeypatch.setattr(analyze, 'load_model', lambda: (None, {'no_llm': object()}, {'schema_version': 2}, {}))
+    monkeypatch.setattr(analyze, 'load_model', lambda: ({'no_llm': object()}, {'schema_version': 2}, {}))
     monkeypatch.setattr(analyze, '_score_email_v2', lambda raw, model: {
         'final_score': .6, 'verdict': 'AI', 'engine_thresholds': {
             'human_cut': .25, 'ai_cut': .55}, 'warnings': [], 'segments': {}})

@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import math
 
-from api import embedding_many
+from src.api.api import embedding_many
 
 MAX_CHARS = 3000  # Less than API's hard 4000-character cap
 OVERLAP = 180

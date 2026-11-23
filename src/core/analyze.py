@@ -1,7 +1,8 @@
-"""Analyze emails with v2 Qwen+context+LLM decision trees (v1 backward compatible)."""
+"""Analyze emails with v2 Qwen+context+LLM decision trees."""
 import argparse
 import asyncio
 import json
+import os
 import pickle
 import sys
 from functools import lru_cache
@@ -9,19 +10,25 @@ from pathlib import Path
 
 import numpy as np
 
-from api import SignalCache, api_signals
-from config import (API_KEY, MODEL_DIR, EMBED_MODEL, MODEL,
+from src.api.api import SignalCache
+from src.utils.config import (API_KEY, MODEL_DIR, EMBED_MODEL, MODEL,
                     SEMANTIC_API_KEY, SEMANTIC_API_URL, SEMANTIC_MODEL)
-from scoring import (embedding_score, features, final_score, final_score_v2,
+from src.core.scoring import (final_score_v2,
                      full_semantic_coverage, scores_for_email, v2_feature_names)
-from segments import KINDS, parse_eml, split_email
-from signals_v2 import collect_rows
-from segmentation_llm import segment_many
-from media_images import extract_images
-from vision import assess_images, combine_scores, IMAGE_WEIGHT
+from src.segmentation.segments import KINDS, parse_eml, split_email
+from src.segmentation.qwen_zones import EXTRA_KINDS, QWEN_KINDS
+from src.core.signals_v2 import collect_rows
+from src.segmentation.segmentation_llm import segment_many
+from src.vision.media_images import extract_images
+from src.vision.vision import assess_images, combine_scores, IMAGE_WEIGHT
 
 RU = {'subject': 'тема', 'greeting': 'приветствие',
-      'body': 'тело', 'signature': 'подпись'}
+      'body': 'тело', 'signature': 'подпись',
+      'introduction': 'вступление', 'main_text': 'основная часть', 'conclusion': 'заключение',
+      'lists': 'списки', 'postscript': 'постскриптум'}
+RU.update({kind: (f'абзац {kind.rsplit("_", 1)[1]}' if kind.startswith('paragraph_')
+                  else f'смысловой блок {kind.rsplit("_", 1)[1]}')
+           for kind in EXTRA_KINDS if kind not in RU})
 
 
 @lru_cache(maxsize=1)
@@ -30,109 +37,26 @@ def load_model():
     missing = [name for name in names if not (MODEL_DIR / name).exists()]
     if missing:
         raise RuntimeError('Не найдены модели: ' + ', '.join(missing) + '. Сначала обучи Qwen-модель.')
-    # TF-IDF необязателен: Qwen v2 по умолчанию работает без tfidf.pkl.
-    # Никогда не загружать чужой/непроверенный pickle: Python pickle может выполнять код.
-    tfidf_path = MODEL_DIR / 'tfidf.pkl'
-    tfidf = None
-    if tfidf_path.is_file():
-        with tfidf_path.open('rb') as f:
-            tfidf = pickle.load(f)
-    with (MODEL_DIR / 'tree.pkl').open('rb') as f:
-        tree = pickle.load(f)
     thresholds = json.loads((MODEL_DIR / 'thresholds.json').read_text(encoding='utf-8'))
-    centers = json.loads((MODEL_DIR / 'centroids.json').read_text(encoding='utf-8'))
-    return tfidf, tree, thresholds, centers
-
-
-def _score_email_v1(raw: bytes | str):
-    tfidf, tree, thresholds, centroids = load_model()
-    if tfidf is None:
-        raise RuntimeError('Старая v1-модель требует tfidf.pkl. Переобучи её или используй Qwen v2.')
-    subject, body = parse_eml(raw)
-    segs = split_email(subject, body)
-    present = [(k, segs[k]) for k in KINDS if segs[k].strip()]
-    if not present:
-        return {'subject': subject, 'verdict': 'UNCERTAIN', 'reason': 'empty_message',
-                'segments': {k: {'present': False, 'score': None} for k in KINDS},
-                'final_score': None, 'flagged_segments': []}
-    texts = [text for _, text in present]
-    predictions = tfidf['clf'].predict_proba(tfidf['vec'].transform(texts))[:, 1]
-    tf_scores = dict(zip((k for k, _ in present), map(float, predictions)))
-
-    wants_embedding = centroids['backend'] == 'api'
-    # API вызовы запускаются параллельно. HTTP-сервер вызывает score_email в threadpool.
-    if API_KEY:
-        with SignalCache(MODEL_DIR / 'cache.sqlite3') as cache:
-            embed_api, sem_api = asyncio.run(api_signals([segs], want_embedding=wants_embedding,
-                                                          want_semantic=bool(thresholds['engine'].get('with_llm')),
-                                                          cache=cache))
-    else:
-        embed_api, sem_api = {}, {}
-    em_scores, sem_scores = {}, {}
-    for kind, text in present:
-        c = centroids['centroids']
-        em_scores[kind] = embedding_score(embed_api.get((kind, text)),
-                                          c.get(f'{kind}_1'), c.get(f'{kind}_0'))
-        sem_scores[kind] = sem_api.get((kind, text))
-    scores = scores_for_email(segs, tf_scores, em_scores, sem_scores)
-    model_features = np.asarray([features(scores)])
-    tree_p = float(tree.predict_proba(model_features)[0][1])
-
-    engine = thresholds['engine']
-    mode = 'with_llm' if engine.get('with_llm') and full_semantic_coverage(scores) else 'no_llm'
-    final = final_score(scores, tree_p, mode)
-    cuts = engine[mode]
-    warnings = []
-    # Независимый fallback после отказа LLM используется только в обученном no_llm-режиме.
-    if centroids['backend'] == 'api' and any(
-        scores[k]['embedding'] is None and
-        centroids['centroids'].get(f'{k}_1') is not None and
-        centroids['centroids'].get(f'{k}_0') is not None for k, _ in present
-    ):
-        warnings.append('API эмбеддингов недоступен: распределение признаков изменилось. Ручная проверка.')
-    if API_KEY and mode == 'no_llm':
-        warnings.append('Семантика API недоступна или не калибрована: использован no_llm режим.')
-    verdict = ('HUMAN' if final < cuts['human_cut'] else
-               'AI' if final >= cuts['ai_cut'] else 'UNCERTAIN')
-    if warnings and centroids['backend'] == 'api' and any(s['embedding'] is None for s in scores.values() if s['present']):
-        verdict = 'UNCERTAIN'
-
-    out = {}
-    flagged = []
-    for kind in KINDS:
-        item = scores[kind]
-        if not item['present']:
-            out[kind] = {'present': False, 'score': None}
-            continue
-        seg_mode = mode if mode == 'no_llm' else (
-            'with_llm' if item['semantic_llm'] is not None else 'no_llm')
-        threshold = thresholds['segments'][kind].get(seg_mode)
-        value = item[seg_mode]
-        label = ('AI' if threshold is not None and value >= threshold else
-                 'HUMAN' if threshold is not None else 'UNDETERMINED')
-        if label == 'AI':
-            flagged.append(kind)
-        out[kind] = {'present': True, 'text_preview': segs[kind][:300],
-                     'tfidf': item['tfidf'], 'embedding': item['embedding'],
-                     'semantic_llm': item['semantic_llm'], 'score': value,
-                     'threshold': threshold, 'label': label}
-
-    certain_labels = [v['label'] for v in out.values() if v.get('label') in {'AI', 'HUMAN'}]
-    if 'AI' in certain_labels and 'HUMAN' in certain_labels and verdict != 'UNCERTAIN':
-        verdict = 'UNCERTAIN'
-        warnings.append('У сегментов конфликтующие метки: возможно смешанное авторство.')
-
-    return {'subject': subject, 'segments': out, 'mode': mode,
-            'tree_probability': round(tree_p, 5), 'final_score': round(float(final), 5),
-            'engine_thresholds': cuts, 'verdict': verdict,
-            'flagged_segments': flagged, 'warnings': warnings,
-            'api_key_set': bool(API_KEY), 'embedding_backend': centroids['backend'],
-            'note': 'Scores/пороги не являются достоверной вероятностью авторства ИИ.'}
-
-
-def _tree_path(tree, row):
-    """Human-readable actual split decisions; not a causal explanation."""
     names = v2_feature_names()
+    saved_names = thresholds.get('feature_names')
+    legacy_names = names.copy()
+    for kind in reversed(KINDS):
+        legacy_names.insert(legacy_names.index(f'{kind}_embedding'), f'{kind}_tfidf')
+    if (thresholds.get('schema_version') != 2 or thresholds.get('use_tfidf') or
+            saved_names not in (names, legacy_names, v2_feature_names(extra_segments=True))):
+        raise RuntimeError('Несовместимая модель. Переобучи её: python -m src.api.local_qwen train')
+    centers = json.loads((MODEL_DIR / 'centroids.json').read_text(encoding='utf-8'))
+    # Загружать только доверенные локальные веса.
+    with (MODEL_DIR / 'tree.pkl').open('rb') as f:
+        trees = pickle.load(f)
+    if not isinstance(trees, dict) or 'no_llm' not in trees:
+        raise RuntimeError('Несовместимый tree.pkl. Переобучи Qwen-модель.')
+    return trees, thresholds, centers
+
+
+def _tree_path(tree, row, names):
+    """Human-readable actual split decisions; not a causal explanation."""
     path = []
     node = 0
     while tree.tree_.children_left[node] != -1:
@@ -149,42 +73,52 @@ def _tree_path(tree, row):
 
 
 def _score_email_v2(raw: bytes | str, model):
-    tfidf, trees, thresholds, centroids = model
+    trees, thresholds, centroids = model
     if centroids['backend'] == 'api' and centroids.get('model') != EMBED_MODEL:
         raise RuntimeError('Qwen embedding model changed: retrain the detector before analysis')
-    subject, body = parse_eml(raw)
+    extra_segments = thresholds['feature_names'] == v2_feature_names(extra_segments=True)
+    kinds = QWEN_KINDS if extra_segments else KINDS
+    subject, body = parse_eml(raw, include_html_quotes=True)
     requires_llm_segmentation = thresholds.get('llm_segmentation', False)
-    segmentation_ok = not requires_llm_segmentation
-    if requires_llm_segmentation:
-        compatible = (bool(SEMANTIC_API_KEY) and
-                      thresholds.get('llm_model') == SEMANTIC_MODEL and
-                      thresholds.get('llm_endpoint', SEMANTIC_API_URL) == SEMANTIC_API_URL)
-        if compatible:
-            with SignalCache(MODEL_DIR / 'cache.sqlite3') as seg_cache:
-                segments_checked = asyncio.run(segment_many([(subject, body)], cache=seg_cache))
-            zones, segmentation_ok = segments_checked[0]
-        else:
-            zones = split_email(subject, body)
+    use_llm_cleanup = requires_llm_segmentation or os.getenv('DETECTOR_LLM_CLEANUP') == '1'
+    compatible = bool(SEMANTIC_API_KEY) and (
+        not requires_llm_segmentation or (
+            thresholds.get('llm_model') == SEMANTIC_MODEL and
+            thresholds.get('llm_endpoint', SEMANTIC_API_URL) == SEMANTIC_API_URL
+        )
+    )
+    if use_llm_cleanup and compatible:
+        with SignalCache(MODEL_DIR / 'cache.sqlite3') as seg_cache:
+            [(zones, segmentation_ok)] = asyncio.run(segment_many(
+                [(subject, body)], cache=seg_cache, semantic_blocks=extra_segments))
     else:
         zones = split_email(subject, body)
+        segmentation_ok = False
     present = [k for k in KINDS if zones[k].strip()]
     if not present:
         return {'subject': subject, 'verdict': 'UNCERTAIN', 'reason': 'empty_message',
-                'segments': {k: {'present': False, 'score': None} for k in KINDS},
+                'segments': {k: {'present': False, 'score': None} for k in kinds},
                 'final_score': None, 'flagged_segments': [], 'warnings': []}
     chat_compatible = ('with_llm' in trees and bool(SEMANTIC_API_KEY) and
                        thresholds.get('llm_model') == SEMANTIC_MODEL and
                        thresholds.get('llm_endpoint', SEMANTIC_API_URL) == SEMANTIC_API_URL)
     with SignalCache(MODEL_DIR / 'cache.sqlite3') as cache:
-        rows = collect_rows([(subject, body, 0)], tfidf, centroids, cache,
+        rows = collect_rows([(subject, body, 0)], centroids, cache,
                             with_llm=bool(chat_compatible), zone_overrides=[zones],
-                            use_owned_context=requires_llm_segmentation)
+                            extra_segments=extra_segments)
     item = rows[0]
     scores = item['scores']
+    zones = item['segments']
     mode = ('with_llm' if 'with_llm' in trees and
             full_semantic_coverage(scores) else 'no_llm')
     tree = trees[mode]
+    names = v2_feature_names(extra_segments=extra_segments)
     feature_vector = item['features_' + mode]
+    saved_names = thresholds['feature_names']
+    if saved_names != names:
+        # Older Qwen-only trees include four inactive inputs fixed at zero.
+        values = dict(zip(names, feature_vector))
+        feature_vector = [values.get(name, 0.) for name in saved_names]
     p = float(tree.predict_proba(np.asarray([feature_vector]))[0, 1])
     final = final_score_v2(scores, p, mode)
     cut = thresholds['engine'][mode]
@@ -196,12 +130,13 @@ def _score_email_v2(raw: bytes | str, model):
         label = 'UNCERTAIN'
     if 'with_llm' in trees and mode == 'no_llm':
         warnings.append('Разговорная LLM не настроена, модель/endpoint не совпадают или не все части оценены: используется no_llm.')
-    if requires_llm_segmentation and not segmentation_ok:
-        warnings.append('LLM-сегментация недоступна; использован алгоритм по правилам. Модель обучена на другой сегментации.')
-        label = 'UNCERTAIN'
+    if use_llm_cleanup and not segmentation_ok:
+        warnings.append('LLM-очистка недоступна; применена эвристическая сегментация.')
+        if requires_llm_segmentation:
+            label = 'UNCERTAIN'
     flagged = []
     details = {}
-    for kind in KINDS:
+    for kind in kinds:
         s = scores[kind]
         if not s['present']:
             details[kind] = {'present': False, 'score': None}
@@ -209,7 +144,7 @@ def _score_email_v2(raw: bytes | str, model):
         selected = mode
         if selected == 'with_llm' and s['semantic_llm'] is None:
             selected = 'no_llm'
-        threshold = thresholds['segments'][kind].get(selected)
+        threshold = thresholds['segments'].get(kind, {}).get(selected)
         value = s[selected]
         if threshold is None or value is None:
             seg_label = 'UNDETERMINED'
@@ -218,25 +153,24 @@ def _score_email_v2(raw: bytes | str, model):
         if seg_label == 'AI':
             flagged.append(kind)
         details[kind] = {'present': True, 'text_preview': zones[kind][:300],
-                         'tfidf': s['tfidf'], 'embedding': s['embedding'],
+                         'embedding': s['embedding'],
                          'embedding_ai_similarity': s['embedding_ai_similarity'],
                          'embedding_human_similarity': s['embedding_human_similarity'],
                          'semantic_llm': s['semantic_llm'], 'score': value,
                          'threshold': threshold, 'label': seg_label}
-    confident_labels = {v['label'] for v in details.values()
-                        if v.get('label') in ('AI', 'HUMAN')}
+    confident_labels = {details[k]['label'] for k in KINDS
+                        if details[k].get('label') in ('AI', 'HUMAN')}
     if len(confident_labels) == 2 and label != 'UNCERTAIN':
         label = 'UNCERTAIN'
         warnings.append('Части письма противоречат друг другу: возможно смешанное авторство.')
     return {'subject': subject, 'segments': details,
             'mode': mode, 'schema_version': 2,
-            'segmentation_method': ('llm_lines' if requires_llm_segmentation and segmentation_ok else 'rules'),
+            'segmentation_method': ('llm_lines' if segmentation_ok else 'rules'),
             'embedding_backend': centroids['backend'], 'embedding_model': centroids['model'],
-            'use_tfidf': tfidf is not None,
             'context_features': item['context'],
             'document_embedding_features': item['doc_signals'],
             'tree_probability': round(p, 5),
-            'tree_decision_path': _tree_path(tree, feature_vector),
+            'tree_decision_path': _tree_path(tree, feature_vector, saved_names),
             'final_score': round(float(final), 5), 'engine_thresholds': cut,
             'verdict': label, 'flagged_segments': flagged, 'warnings': warnings,
             'api_key_set': bool(API_KEY),
@@ -245,13 +179,7 @@ def _score_email_v2(raw: bytes | str, model):
 
 def score_email(raw: bytes | str):
     """Text scoring + optional image judgment; no vision API call for text-only mail."""
-    model = load_model()
-    if model[2].get('schema_version') == 2:
-        if not isinstance(model[1], dict) or 'no_llm' not in model[1]:
-            raise RuntimeError('Incompatible v2 tree.pkl, retrain with the updated train.py')
-        result = _score_email_v2(raw, model)
-    else:
-        result = _score_email_v1(raw)
+    result = _score_email_v2(raw, load_model())
     photos, media_warnings = extract_images(raw)
     result.setdefault('warnings', []).extend(media_warnings)
     result['text_final_score'] = result.get('final_score')
@@ -313,13 +241,12 @@ def main():
         return
     print(f'Тема: {result["subject"] or "(нет)"}')
     print(f'Режим: {result.get("mode", "нет")}; embeddings: {result.get("embedding_backend", "нет")}')
-    print(f'{"СЕГМЕНТ":<16} {"TF-IDF":>9} {"EMBED":>9} {"LLM":>9} {"SCORE":>9} {"ПОРОГ":>9} МЕТКА')
-    for k in KINDS:
-        v = result['segments'][k]
+    print(f'{"СЕГМЕНТ":<16} {"EMBED":>9} {"LLM":>9} {"SCORE":>9} {"ПОРОГ":>9} МЕТКА')
+    for k, v in result['segments'].items():
         if not v['present']:
             print(f'{RU[k]:<16} (зона отсутствует)')
             continue
-        print(f'{RU[k]:<16} {fmt(v["tfidf"]):>9} {fmt(v["embedding"]):>9} '
+        print(f'{RU[k]:<16} {fmt(v["embedding"]):>9} '
               f'{fmt(v["semantic_llm"]):>9} {fmt(v["score"]):>9} '
               f'{fmt(v["threshold"]):>9} {v["label"]}')
     print(f'Decision Tree: {fmt(result.get("tree_probability"))}')

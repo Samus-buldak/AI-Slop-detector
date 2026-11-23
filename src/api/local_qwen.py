@@ -8,11 +8,11 @@ import shutil
 import subprocess
 import sys
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[2]
 MODEL_ID = 'qwen3-embedding-local'
 MODEL_KEY = 'text-embedding-qwen3-embedding-0.6b'
 LOCAL_ENDPOINT = 'http://127.0.0.1:1234/v1'
-MODEL_FOLDER = 'model_hybrid_qwen'  # Does not overwrite previous model_local_qwen/
+MODEL_FOLDER = 'artifacts/model_hybrid_qwen'
 
 
 def _original_chat_settings():
@@ -49,6 +49,9 @@ def configure(chat_model=None, llm_from_env=False):
                       EMB_BATCH='8', EMB_CONC='1', SEM_BATCH='2', SEM_CONC='1',
                       API_TIMEOUT='120', API_RETRIES='1',
                       DETECTOR_MODEL_DIR=MODEL_FOLDER)
+    if not remote:
+        os.environ.update(VISION_API_URL=LOCAL_ENDPOINT, VISION_API_KEY='lm-studio',
+                          VISION_MODEL=local_chat)
 
 
 def _probe_embedding():
@@ -79,7 +82,8 @@ def ensure_embedding():
         return
     lms = shutil.which('lms')
     if not lms:
-        candidate = Path.home() / '.lmstudio/bin/lms.exe'
+        binary = 'lms.exe' if sys.platform == 'win32' else 'lms'
+        candidate = Path.home() / '.lmstudio' / 'bin' / binary
         lms = str(candidate) if candidate.is_file() else None
     if not lms:
         raise RuntimeError('Qwen endpoint did not respond, and LM Studio CLI was not found. '
@@ -112,8 +116,13 @@ def main():
     parser.add_argument('--llm-from-env', action='store_true',
                         help='Use API_URL, API_KEY, MODEL from original .env for chat ONLY; '
                              'the email segments will be sent to that external service')
+    parser.add_argument('--llm-cleanup', action='store_true',
+                        help='Enable chat-based quote cleanup and segmentation for analysis')
     args, rest = parser.parse_known_args()
-    os.chdir(ROOT)
+    if args.llm_cleanup:
+        if args.command not in {'text', 'analyze', 'server'}:
+            parser.error('--llm-cleanup is for analysis; use train --with-llm --llm-segmentation for training')
+        os.environ['DETECTOR_LLM_CLEANUP'] = '1'
     if args.llm_from_env and args.llm_model:
         parser.error('--llm-from-env and --llm-model cannot be used together')
     configure(chat_model=args.llm_model, llm_from_env=args.llm_from_env)
@@ -121,30 +130,28 @@ def main():
     if args.command == 'check':
         return
     if args.command == 'train':
-        if '--offline' in rest or '--no-llm' in rest:
-            parser.error('Local Qwen training needs embeddings; omit --offline/--no-llm.')
         if '--with-llm' in rest and not args.llm_from_env and os.environ['MODEL'] == 'unused-local-semantic-disabled':
             parser.error('Use --llm-from-env to activate your original .env chat model; '
                          'otherwise set LOCAL_LLM_MODEL or --llm-model <loaded-chat-model-id>.')
         sys.argv = ['train.py', *rest]
-        runpy.run_path(str(ROOT / 'train.py'), run_name='__main__')
+        runpy.run_module('src.core.train', run_name='__main__')
         saved = json.loads((ROOT / MODEL_FOLDER / 'centroids.json').read_text(encoding='utf-8'))
         if saved['backend'] != 'api' or saved['model'] != MODEL_ID:
             raise RuntimeError('Training did not produce Qwen embedding centroids.')
     else:
         path = ROOT / MODEL_FOLDER / 'centroids.json'
         if not path.exists():
-            raise RuntimeError('Train first: local_qwen.py train')
+            raise RuntimeError('Train first: python -m src.api.local_qwen train')
         saved = json.loads(path.read_text(encoding='utf-8'))
         if saved['backend'] != 'api' or saved['model'] != MODEL_ID:
-            raise RuntimeError('Incompatible Qwen model artifacts; run local_qwen.py train again.')
+            raise RuntimeError('Incompatible Qwen model artifacts; run python -m src.api.local_qwen train again.')
         if args.command == 'server':
             import uvicorn
-            uvicorn.run('server:app', host='127.0.0.1', port=8000)
+            uvicorn.run('src.api.server:app', host='127.0.0.1', port=8000)
         else:
-            script = 'test_my_text.py' if args.command == 'text' else 'analyze.py'
-            sys.argv = [script, *rest]
-            runpy.run_path(str(ROOT / script), run_name='__main__')
+            module = 'test_my_text' if args.command == 'text' else 'src.core.analyze'
+            sys.argv = [module, *rest]
+            runpy.run_module(module, run_name='__main__')
 
 
 if __name__ == '__main__':

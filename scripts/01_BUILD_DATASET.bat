@@ -1,13 +1,13 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0.."
 set "PY=.venv\Scripts\python.exe"
 if not exist "%PY%" (
   echo [ERROR] Install the project venv first: py -3 -m venv .venv
   pause
   exit /b 1
 )
-"%PY%" protect_git.py || goto :failed
+"%PY%" -m src.utils.protect_git || goto :failed
 "%PY%" prepare_human.py --count 1000 || goto :failed
 "%PY%" review_human.py --count 50 || goto :failed
 "%PY%" generate_ai.py --count 1000 --lang en --batch 3 --parallel 3 || goto :failed

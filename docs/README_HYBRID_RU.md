@@ -19,16 +19,16 @@
 2. В LM Studio загрузи `qwen3-embedding-local` и включи локальный сервер порта 1234. Chat-модель локально **не нужна**, потому что разговорная LLM берётся из `.env`.
 3. `03_LOCAL_QWEN_CHECK.bat` — проверить 1024 числа от Qwen.
 4. **`09_QWEN_ENV_LLM_TRAIN.bat`** — обучить два дерева на твоём датасете. Использует внешний API на наборе `stack`, калибровке и тесте. Этап может потреблять лимиты / деньги API.
-5. **`10_QWEN_ENV_LLM_TEXT.bat`** — проверить свой текст (введи письмо одной строкой и нажми Enter). Для `.eml` запусти `local_qwen.py analyze --llm-from-env "path\\to\\letter.eml" --json`.
+5. **`10_QWEN_ENV_LLM_TEXT.bat`** — проверить свой текст (введи письмо одной строкой и нажми Enter). Для `.eml` запусти `python -m src.api.local_qwen analyze --llm-from-env "path\\to\\letter.eml" --json`.
 6. **`11_QWEN_ENV_LLM_SERVER.bat`** — запустить `http://127.0.0.1:8000/docs`, `POST /analyze`.
 
 Команды в PowerShell (в корне проекта):
 
 ```powershell
-.\.venv-local\Scripts\python.exe local_qwen.py train --llm-from-env --with-llm
-.\.venv-local\Scripts\python.exe local_qwen.py text --llm-from-env
-.\.venv-local\Scripts\python.exe local_qwen.py analyze --llm-from-env "letter.eml" --json
-.\.venv-local\Scripts\python.exe local_qwen.py server --llm-from-env
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen train --llm-from-env --with-llm
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen text --llm-from-env
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen analyze --llm-from-env "letter.eml" --json
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen server --llm-from-env
 ```
 
 ## Что конкретно передаётся LLM
@@ -39,12 +39,12 @@
 
 `data/dataset.csv` с метками `is_ai`: `1` — ИИ, `0` — человек. После дедупликации случайное разбиение с фиксированным seed и сохранением баланса классов: `base` (центроиды Qwen, PCA), `stack` (обучение дерева `no_llm` и дерева `with_llm`), `calib` (пороги зон и итоговые границы HUMAN/UNCERTAIN/AI), `test` (ROC AUC, balanced accuracy, precision, recall, доля неопределённости). На стадии `base` chat LLM **не вызывается**. Весовые коэффициенты самой Qwen и chat LLM **не обучаются**.
 
-Каждая зона (если присутствует) имеет TF-IDF (по умолчанию 0/отключено), Qwen score и сходства с AI/HUMAN центроидами, semantic LLM score (при with_llm). Письмо целиком имеет Qwen score, AI/HUMAN сходства, PCA-проекцию на 8 компонент и связность 3 пар зон. Плюс 21 контекстный признак. Всего 77 фиксированных признаков (часть нулевая при отключённом TF-IDF или LLM). Дерево ограничено глубиной 4 и использует размеченные примеры. Итоговый score: `0.8 * tree_probability + 0.2 * mean(zone_scores)`. Это эвристика, а не реальная вероятность авторства.
+Каждая зона (если присутствует) имеет Qwen score и сходства с AI/HUMAN центроидами, semantic LLM score (при with_llm). Письмо целиком имеет Qwen score, AI/HUMAN сходства, PCA-проекцию на 8 компонент и связность 3 пар зон. Плюс 21 контекстный признак. Новая схема добавляет структурные зоны, абзацы и смысловые блоки Qwen. Всего 141 фиксированный признак (отсутствующие сигналы кодируются нулями). Дерево ограничено глубиной 4 и использует размеченные примеры. Итоговый score: `0.8 * tree_probability + 0.2 * mean(zone_scores)`. Это эвристика, а не реальная вероятность авторства.
 
 При анализе нового письма **вся та же** предобработка. Если chat-модель совпадает по ID и адресу с моделью обучения, а все непустые части оценены, выбирается `with_llm`; иначе — `no_llm`. Если Qwen-векторы отсутствуют, итог `UNCERTAIN`. Если части дают конфликтующие HUMAN/AI, итог тоже `UNCERTAIN`.
 
 ## Проверка и ограничения
 
-После обучения проверь `model_hybrid_qwen/thresholds.json`: `with_llm_trained: true`, `llm_model: ...`, `llm_endpoint: ...`; не храни там ключ. При запуске текста должно быть `Режим: with_llm` и в столбце LLM — числа. Если `no_llm`, изучи предупреждения, ID модели, адрес, доступность сервера и качество JSON ответа. Новая модель сохраняется в `model_hybrid_qwen`, старые `model` / `model_local_qwen` не затрагиваются.
+После обучения проверь `artifacts/model_hybrid_qwen/thresholds.json`: `with_llm_trained: true`, `llm_model: ...`, `llm_endpoint: ...`; не храни там ключ. При запуске текста должно быть `Режим: with_llm` и в столбце LLM — числа. Если `no_llm`, изучи предупреждения, ID модели, адрес, доступность сервера и качество JSON ответа. Новая модель сохраняется в `artifacts/model_hybrid_qwen`, старые `model` / `artifacts/model_local_qwen` не затрагиваются.
 
 На этой машине проверены маршрутизация через mock HTTP (раздельные endpoint и Authorization), 18 тестов, синтаксис Python. Подключение к настоящей внешней LLM и твоему локальному LM Studio здесь не проверялось. Детектор **не может надёжно доказать**, кем написан текст; синтетические данные и разные источники писем могут завышать точность.

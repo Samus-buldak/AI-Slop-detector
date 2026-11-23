@@ -12,7 +12,7 @@ from pathlib import Path
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError
 
-from config import API_KEY, API_URL, MODEL
+from src.utils.config import API_KEY, API_URL, MODEL
 from llm_client import create_async_client
 
 TOPICS = [

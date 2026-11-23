@@ -1,3 +1,5 @@
+> Архивное описание v1. Для действующего Qwen-детектора см. [README_V2_RU.md](README_V2_RU.md).
+
 > **Описание старой версии v1.** Схема новой версии описана в [README_V2_RU.md](README_V2_RU.md).
 
 # Как работает пайплайн — объяснение для защиты
@@ -62,13 +64,6 @@
 
 ## 8. Что показывать преподавателю
 
-```sh
-python train.py --csv data/demo_synthetic.csv --offline
-python analyze.py examples/human_invoice.eml
-python analyze.py examples/ai_slop_newsletter.eml
-python analyze.py examples/mixed_human_plus_ai.eml --json
-uvicorn server:app --port 8000
-pytest -q
-```
+Команды запуска актуальной модели приведены в [README_V2_RU.md](README_V2_RU.md).
 
 Далее показать `model/thresholds.json`, `model/test_metrics.json`, вывод дерева из `train.py`, и в коде `api.py` запросы `/chat/completions` и `/embeddings`. Обязательно объяснить, что без настоящего API-ключа **только офлайн-тест и мок-интеграция** проверены, и на синтетических шаблонах точность не означает реальную точность определения авторства.

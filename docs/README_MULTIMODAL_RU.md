@@ -22,9 +22,9 @@
 5. Выполни **`12_QWEN_ENV_LLM_IMAGE_TEXT.bat`** (вручную укажи путь к фото или оставь пустым) либо `10_QWEN_ENV_LLM_TEXT.bat` для только текста. При ручном вводе текст письма вводится одной строкой и отправляется нажатием Enter. Ещё один способ — командная строка:
 
    ```powershell
-   .\.venv-local\Scripts\python.exe local_qwen.py text --llm-from-env --image "C:\Users\you\Pictures\photo.jpg"
-   .\.venv-local\Scripts\python.exe local_qwen.py text --llm-from-env --image "photo1.jpg" --image "photo2.png" "message.txt"
-   .\.venv-local\Scripts\python.exe local_qwen.py analyze --llm-from-env "letter.eml" --json
+   .\.venv-local\Scripts\python.exe -m src.api.local_qwen text --llm-from-env --image "C:\Users\you\Pictures\photo.jpg"
+   .\.venv-local\Scripts\python.exe -m src.api.local_qwen text --llm-from-env --image "photo1.jpg" --image "photo2.png" "message.txt"
+   .\.venv-local\Scripts\python.exe -m src.api.local_qwen analyze --llm-from-env "letter.eml" --json
    ```
 
 6. Для почты можно перетащить `.eml` на **`13_QWEN_ENV_LLM_EML.bat`**. В API `POST /analyze` достаточно передать `.eml` или multipart поле `file` — вложения разберутся автоматически. Лимит HTTP-запроса: 5 МБ.

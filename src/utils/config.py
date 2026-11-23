@@ -2,8 +2,8 @@
 import os
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-for raw_line in (ROOT / '.env').read_text(encoding='utf-8').splitlines() if (ROOT / '.env').is_file() else []:
+ROOT = Path(__file__).resolve().parents[2]
+for raw_line in (ROOT / '.env').read_text(encoding='utf-8-sig').splitlines() if (ROOT / '.env').is_file() else []:
     line = raw_line.strip()
     if line and not line.startswith('#') and '=' in line:
         key, value = line.split('=', 1)

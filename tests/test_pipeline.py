@@ -7,11 +7,11 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-import api
-from scoring import embedding_score, features, full_semantic_coverage, mean_present, scores_for_email
-from segments import KINDS, parse_eml, split_email
-from server import app
-from train import best_cut, split_rows
+from src.api import api
+from src.core.scoring import embedding_score, full_semantic_coverage, mean_present, scores_for_email
+from src.segmentation.segments import KINDS, parse_eml, split_email
+from src.api.server import app
+from src.core.train import best_cut, split_rows
 
 
 def test_mime_subject_body_html_and_attachment_ignored():
@@ -42,9 +42,9 @@ def test_html_only_and_no_leaked_scripts():
 
 def test_no_zero_padding_when_zones_absent():
     zones = {'subject': '', 'greeting': '', 'body': 'Только основное письмо', 'signature': ''}
-    scores = scores_for_email(zones, {'body': 0.8}, {}, {})
+    scores = scores_for_email(zones, {'body': 0.8}, {})
     assert mean_present([scores[k]['no_llm'] for k in KINDS]) == 0.8
-    assert features(scores)[8] == pytest.approx(0.8)
+    assert scores['body']['no_llm'] == pytest.approx(0.8)
     assert not full_semantic_coverage(scores)
     assert embedding_score(None, [1., 0.], [0., 1.]) is None
 
@@ -116,7 +116,7 @@ def test_embedding_api_actual_vectors_not_hash(monkeypatch):
 
 def test_http_raw_multipart_and_413(monkeypatch):
     # Keep this route test independent of optional trained model artifacts.
-    import server
+    from src.api import server
     monkeypatch.setattr(server, 'score_email', lambda raw: {'final_score': 0.42})
     app_client = TestClient(app)
     raw = (b'Subject: hello\nContent-Type: text/plain; charset=utf-8\n\n'

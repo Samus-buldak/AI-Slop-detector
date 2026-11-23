@@ -14,7 +14,7 @@ from pathlib import Path
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 
 from llm_client import create_async_client
-from config import (API_KEY, API_RETRIES, API_TIMEOUT, API_URL, EMB_BATCH,
+from src.utils.config import (API_KEY, API_RETRIES, API_TIMEOUT, API_URL, EMB_BATCH,
                     EMB_CONC, EMBED_MODEL, SEM_BATCH, SEM_CONC,
                     SEMANTIC_API_URL, SEMANTIC_API_KEY, SEMANTIC_MODEL,
                     VISION_API_URL, VISION_API_KEY)

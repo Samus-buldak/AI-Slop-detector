@@ -14,9 +14,9 @@ import re
 
 from openai import AsyncOpenAI
 
-from api import _post
+from src.api.api import _post
 from llm_client import create_async_client
-from config import VISION_API_KEY, VISION_API_URL, VISION_MODEL
+from src.utils.config import VISION_API_KEY, VISION_API_URL, VISION_MODEL
 
 VISION_PROMPT = 'origin-of-photo-v1'
 IMAGE_WEIGHT = 0.20  # heuristic: not fitted on image-labelled data

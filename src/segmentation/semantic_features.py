@@ -3,7 +3,8 @@ import json
 import hashlib
 import sqlite3
 from typing import Dict
-from config import get_llm_client
+from llm_client import create_sync_client
+from src.utils.config import SEMANTIC_API_KEY, SEMANTIC_API_URL
 
 # Кэш для повторных запросов
 CACHE_DB = "semantic_cache.db"
@@ -53,7 +54,6 @@ def analyze_segment_semantics(text: str, model_name: str = "qwen2.5-7b-instruct"
     if cached:
         return cached
     
-    client = get_llm_client()
     
     prompt = f"""
     Ты — лингвистический анализатор. Оцени текст по трем шкалам от 0.0 до 1.0.
@@ -70,13 +70,14 @@ def analyze_segment_semantics(text: str, model_name: str = "qwen2.5-7b-instruct"
     """
     
     try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            response_format={"type": "json_object"},
-            timeout=30.0
-        )
+        with create_sync_client(SEMANTIC_API_KEY, SEMANTIC_API_URL) as client:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                response_format={"type": "json_object"},
+                timeout=30.0
+            )
         
         content = response.choices[0].message.content
         result = json.loads(content)

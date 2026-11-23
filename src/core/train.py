@@ -1,6 +1,6 @@
 """Four disjoint stages: base embeddings -> stacked trees -> calibration -> held-out test.
 
-Qwen embedding is the default. TF-IDF is optional (--use-tfidf), never required.
+Qwen embeddings supply the text representation.
 Independent trees are trained for no-LLM and with-LLM feature distributions.
 """
 import argparse
@@ -14,20 +14,19 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (balanced_accuracy_score, confusion_matrix, precision_score,
                              recall_score, roc_auc_score)
 from sklearn.tree import DecisionTreeClassifier, export_text
 
-from api import SignalCache
-from embedding_pipeline import embedding_vectors, fit_document_projection
-from config import (API_KEY, DATA_DIR, MODEL_DIR, SEMANTIC_API_KEY,
+from src.api.api import SignalCache
+from src.features.embedding_pipeline import embedding_vectors, fit_document_projection
+from src.utils.config import (API_KEY, DATA_DIR, MODEL_DIR, SEMANTIC_API_KEY,
                     SEMANTIC_API_URL, SEMANTIC_MODEL)
-from scoring import (final_score_v2, full_semantic_coverage, v2_feature_names)
-from segments import KINDS, document_text, parse_eml, split_email
-from signals_v2 import collect_rows
-from segmentation_llm import segment_many
+from src.core.scoring import (final_score_v2, full_semantic_coverage, v2_feature_names)
+from src.segmentation.segments import document_text, parse_eml, split_email
+from src.core.signals_v2 import collect_rows
+from src.segmentation.segmentation_llm import PROMPT_VERSION, segment_many
+from src.segmentation.qwen_zones import QWEN_KINDS, expand_qwen_zones
 
 
 def load_data(csv_path=None):
@@ -60,7 +59,7 @@ def load_data(csv_path=None):
             raise FileNotFoundError(f'Нет файла: {path}')
         for folder, label in (('human', 0), ('ai', 1)):
             for file in sorted((DATA_DIR / folder).rglob('*.eml')):
-                subject, body = parse_eml(file.read_bytes())
+                subject, body = parse_eml(file.read_bytes(), include_html_quotes=True)
                 if body:
                     rows.append((subject, body, label))
         if not rows:
@@ -110,22 +109,6 @@ def split_rows(rows, seed, stack_limit, calib_limit, test_limit):
     return split
 
 
-def fit_tfidf(rows):
-    texts, labels = [], []
-    for subject, body, label in rows:
-        for text in split_email(subject, body).values():
-            if text.strip():
-                texts.append(text)
-                labels.append(label)
-    vec = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, min_df=2,
-                          max_features=30000, token_pattern=r'(?u)\b\w+\b')
-    x = vec.fit_transform(texts)
-    clf = LogisticRegression(max_iter=350, class_weight='balanced', solver='liblinear', random_state=42)
-    clf.fit(x, labels)
-    print(f'[tfidf] {len(texts)} зон, {x.shape[1]} признаков')
-    return {'vec': vec, 'clf': clf}
-
-
 def normalize_center(vectors):
     avg = np.asarray(vectors, dtype=float).mean(axis=0)
     norm = np.linalg.norm(avg)
@@ -134,9 +117,7 @@ def normalize_center(vectors):
 
 def fit_centroids(rows, cache, per_class, llm_segment=False):
     """Per-zone + full-document local Qwen centroids, fit ONLY on base split."""
-    if not API_KEY:
-        return {'backend': 'none', 'centroids': {}, 'model': None}
-    from config import EMBED_MODEL
+    from src.utils.config import EMBED_MODEL
     probe = embedding_vectors(['embedding probe'], cache=cache)
     if not probe[0]:
         raise RuntimeError('No real /embeddings response. Check LM Studio/Qwen; no fake vectors used.')
@@ -147,13 +128,14 @@ def fit_centroids(rows, cache, per_class, llm_segment=False):
         chosen = rng.choice(len(candidates), size=min(per_class, len(candidates)), replace=False)
         subset.extend(candidates[i] for i in chosen)
     if llm_segment:
-        enhanced = asyncio.run(segment_many([(a, b) for a, b, _ in subset], cache=cache, verbose=True))
+        enhanced = asyncio.run(segment_many([(a, b) for a, b, _ in subset], cache=cache, verbose=True, semantic_blocks=True))
         segs = [z for z, _ in enhanced]
         print(f'[segmentation:base] LLM used: {sum(used for _, used in enhanced)}/{len(enhanced)}')
     else:
         segs = [split_email(subject, body) for subject, body, _ in subset]
+    segs = [expand_qwen_zones(zones) for zones in segs]
     zone_keys = list(dict.fromkeys((kind, zones[kind]) for zones in segs
-                                   for kind in KINDS if zones[kind].strip()))
+                                   for kind in QWEN_KINDS if zones[kind].strip()))
     docs = [document_text(zone) for zone in segs]
     vectors = embedding_vectors([text for _, text in zone_keys] + docs,
                                 cache=cache, verbose=True)
@@ -163,7 +145,7 @@ def fit_centroids(rows, cache, per_class, llm_segment=False):
     for row, zones, vec in zip(subset, segs, document_vectors):
         if vec is not None:
             grouped.setdefault(('document', row[2]), []).append(vec)
-        for kind in KINDS:
+        for kind in QWEN_KINDS:
             val = zone_embeddings.get((kind, zones[kind]))
             if val is not None:
                 grouped.setdefault((kind, row[2]), []).append(val)
@@ -182,15 +164,15 @@ def fit_centroids(rows, cache, per_class, llm_segment=False):
             'projection': projection}
 
 
-def score_rows(rows, tfidf, centroids, cache, use_sem, llm_segment=False):
+def score_rows(rows, centroids, cache, use_sem, llm_segment=False):
     """Legacy helper name kept for tests / callers, using the v2 feature engine."""
-    enhanced = (asyncio.run(segment_many([(a, b) for a, b, _ in rows], cache=cache, verbose=True))
+    enhanced = (asyncio.run(segment_many([(a, b) for a, b, _ in rows], cache=cache, verbose=True, semantic_blocks=True))
                 if llm_segment else None)
     if enhanced is not None:
         print(f'[segmentation] LLM used: {sum(ok for _, ok in enhanced)}/{len(enhanced)}')
-    return collect_rows(rows, tfidf, centroids, cache, with_llm=use_sem,
+    return collect_rows(rows, centroids, cache, with_llm=use_sem,
                         verbose=True, zone_overrides=[z for z, _ in enhanced] if enhanced else None,
-                        use_owned_context=llm_segment)
+                        extra_segments=True)
 
 
 def best_cut(labels, scores):
@@ -216,7 +198,7 @@ def best_cut(labels, scores):
 
 def calibrate_segments(rows):
     thresholds = {}
-    for kind in KINDS:
+    for kind in QWEN_KINDS:
         thresholds[kind] = {}
         for mode in ('no_llm', 'with_llm'):
             subset = [(r['label'], r['scores'][kind][mode]) for r in rows
@@ -293,53 +275,42 @@ def evaluate(rows, trees, engine):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--csv', type=Path, help='CSV; default data/dataset.csv')
-    parser.add_argument('--offline', '--no-llm', action='store_true',
-                        help='disable all API calls; requires --use-tfidf')
     parser.add_argument('--no-semantic', action='store_true', help='alias for default: do not use a chat LLM')
     parser.add_argument('--llm-segmentation', action='store_true',
                         help='LLM segments own lines in every training/evaluation stage (requires --with-llm)')
     parser.add_argument('--with-llm', action='store_true',
                         help='include independently scored chat-LLM features in a second tree')
-    parser.add_argument('--use-tfidf', action='store_true',
-                        help='optional classic baseline; by default Qwen-only')
     parser.add_argument('--centroid-per-class', type=int, default=120)
     parser.add_argument('--stack-per-class', type=int, default=150)
     parser.add_argument('--calib-per-class', type=int, default=120)
     parser.add_argument('--test-per-class', type=int, default=80)
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
-    if args.offline and not args.use_tfidf:
-        parser.error('--offline requires --use-tfidf, otherwise neither text model nor embeddings are available')
     if args.llm_segmentation and not args.with_llm:
         parser.error('--llm-segmentation requires --with-llm')
-    if args.llm_segmentation and args.use_tfidf:
-        parser.error('--llm-segmentation and --use-tfidf cannot be combined yet')
-    if args.with_llm and (args.no_semantic or args.offline):
-        parser.error('--with-llm cannot be combined with --no-semantic / --offline')
-    if not args.offline and not API_KEY and not args.use_tfidf:
-        parser.error('Qwen endpoint is not configured; use local_qwen.py train or --use-tfidf --offline')
+    if args.with_llm and args.no_semantic:
+        parser.error('--with-llm cannot be combined with --no-semantic')
+    if not API_KEY:
+        parser.error('Qwen endpoint is not configured; use python -m src.api.local_qwen train')
     t0 = time.perf_counter()
     rows = load_data(args.csv)
     parts = split_rows(rows, args.seed, args.stack_per_class, args.calib_per_class, args.test_per_class)
     print('[split]', {k: dict(Counter(row[2] for row in v)) for k, v in parts.items()})
-    tfidf = fit_tfidf(parts['base']) if args.use_tfidf else None
     MODEL_DIR.mkdir(exist_ok=True, parents=True)
-    use_api = bool(API_KEY) and not args.offline
     use_sem = bool(SEMANTIC_API_KEY) and args.with_llm
     if args.with_llm and not use_sem:
         parser.error('No chat LLM API key configured for --with-llm')
     with SignalCache(MODEL_DIR / 'cache.sqlite3') as cache:
-        centroids = fit_centroids(parts['base'], cache, max(3, args.centroid_per_class), llm_segment=args.llm_segmentation) if use_api else {
-            'backend': 'none', 'centroids': {}, 'model': None}
+        centroids = fit_centroids(parts['base'], cache, max(3, args.centroid_per_class), llm_segment=args.llm_segmentation)
         print('[stack] fitting no-LLM tree on stack-only examples')
-        stack = score_rows(parts['stack'], tfidf, centroids, cache, use_sem=use_sem, llm_segment=args.llm_segmentation)
+        stack = score_rows(parts['stack'], centroids, cache, use_sem=use_sem, llm_segment=args.llm_segmentation)
         x_stack = np.asarray([r['features_no_llm'] for r in stack])
         y_stack = np.asarray([r['label'] for r in stack])
         def new_tree():
             return DecisionTreeClassifier(max_depth=4, min_samples_leaf=max(5, len(stack) // 50),
                                           class_weight='balanced', random_state=args.seed)
         trees = {'no_llm': new_tree().fit(x_stack, y_stack)}
-        print(export_text(trees['no_llm'], feature_names=v2_feature_names()))
+        print(export_text(trees['no_llm'], feature_names=v2_feature_names(extra_segments=True)))
         if use_sem:
             sem_stack = [r for r in stack if full_semantic_coverage(r['scores'])]
             if len({r['label'] for r in sem_stack}) < 2 or len(sem_stack) < 12:
@@ -350,7 +321,7 @@ def main():
                 np.asarray([r['label'] for r in sem_stack]))
             print('[stack:with_llm] trained on', len(sem_stack), 'complete judgments')
         print('[calib] choosing cutoffs on independent samples')
-        calib = score_rows(parts['calib'], tfidf, centroids, cache, use_sem=use_sem, llm_segment=args.llm_segmentation)
+        calib = score_rows(parts['calib'], centroids, cache, use_sem=use_sem, llm_segment=args.llm_segmentation)
         segment_cuts = calibrate_segments(calib)
         engine = {'no_llm': engine_thresholds(calib, trees['no_llm'], 'no_llm')}
         if engine['no_llm'] is None:
@@ -362,32 +333,22 @@ def main():
         print('[thresholds] segments:', json.dumps(segment_cuts, ensure_ascii=False))
         print('[thresholds] engine:', engine)
         print('[test] held-out data, never used in fitting / calibration')
-        test = score_rows(parts['test'], tfidf, centroids, cache, use_sem=use_sem, llm_segment=args.llm_segmentation)
+        test = score_rows(parts['test'], centroids, cache, use_sem=use_sem, llm_segment=args.llm_segmentation)
     report = evaluate(test, trees, engine)
     print('[metrics] held-out:', json.dumps(report, indent=2, ensure_ascii=False))
     thresholds = {'schema_version': 2, 'segments': segment_cuts, 'engine': engine,
                   'embedding_backend': centroids['backend'],
-                  'use_tfidf': args.use_tfidf, 'with_llm_trained': bool('with_llm' in trees),
+                  'with_llm_trained': bool('with_llm' in trees),
                   'llm_segmentation': bool(args.llm_segmentation),
-                  'segmentation_version': ('line-boundaries-v1' if args.llm_segmentation else 'rules'),
+                  'segmentation_version': (PROMPT_VERSION if args.llm_segmentation else 'rules'),
                   'llm_model': (SEMANTIC_MODEL if use_sem else None),
                   'llm_endpoint': (SEMANTIC_API_URL if use_sem else None),
-                  'feature_names': v2_feature_names(),
+                  'feature_names': v2_feature_names(extra_segments=True),
                   'class_mapping': {'0': 'HUMAN', '1': 'AI'}}
-    # Atomic writes prevent a partial, mismatched model directory after interruption.
-    # Qwen-only training does not create a meaningless tfidf.pkl containing None.
-    if tfidf is not None:
-        artifacts = (('tfidf.pkl', tfidf), ('tree.pkl', trees))
-    else:
-        artifacts = (('tree.pkl', trees),)
-        stale_tfidf = MODEL_DIR / 'tfidf.pkl'
-        if stale_tfidf.exists():
-            stale_tfidf.unlink()
-    for name, artifact in artifacts:
-        tmp = MODEL_DIR / (name + '.tmp')
-        with tmp.open('wb') as fh:
-            pickle.dump(artifact, fh)
-        tmp.replace(MODEL_DIR / name)
+    tmp = MODEL_DIR / 'tree.pkl.tmp'
+    with tmp.open('wb') as fh:
+        pickle.dump(trees, fh)
+    tmp.replace(MODEL_DIR / 'tree.pkl')
     for name, obj in (('centroids.json', centroids), ('thresholds.json', thresholds),
                       ('test_metrics.json', report)):
         tmp = MODEL_DIR / (name + '.tmp')

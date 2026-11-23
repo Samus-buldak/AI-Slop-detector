@@ -13,15 +13,13 @@
 - Чатовая оценка и необязательная сегментация: Qwen Chat через OpenAI-compatible API.
 - Клиент: официальный Python SDK `openai`.
 - Ручной ввод: всё письмо одной строкой, затем Enter.
-- Стандартная Qwen v2-модель не требует TF-IDF и не создаёт фиктивный `tfidf.pkl`.
 - `tree.pkl`, `centroids.json`, `thresholds.json` и `test_metrics.json` — обученные артефакты; SQLite-кэш не нужен для воспроизведения модели.
 
 ## Перед коммитом
 
 - Убедись, что `.env` не отображается в `git status`.
 - Не добавляй `.venv/`, `.venv-local/`, `__pycache__/`, `*.sqlite3*`.
-- Если коммитишь уже обученную гибридную модель, добавь `model_hybrid_qwen/tree.pkl`, `centroids.json`, `thresholds.json`, `test_metrics.json`.
-- Не добавляй `model_hybrid_qwen/tfidf.pkl`: в Qwen-only режиме этот файл не нужен.
+- Если коммитишь уже обученную гибридную модель, добавь `artifacts/model_hybrid_qwen/tree.pkl`, `centroids.json`, `thresholds.json`, `test_metrics.json`.
 - Запусти `pytest -q` и проверь `git diff --cached --check` перед коммитом.
 
 Пример сообщения коммита: `feat: add Qwen hybrid email detection`.

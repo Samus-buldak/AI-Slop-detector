@@ -1,9 +1,9 @@
-﻿@echo off
+@echo off
 chcp 65001 >nul
 set "PYTHONUTF8=1"
-cd /d "%~dp0"
+cd /d "%~dp0.."
 echo =====================================================
-echo Kirusha AI Detector v2.2: first setup and quick start
+echo AI Slop Detector: setup and launch
  echo =====================================================
 if not exist ".venv-local\Scripts\python.exe" (
   echo Creating Python environment...
@@ -11,12 +11,8 @@ if not exist ".venv-local\Scripts\python.exe" (
   if errorlevel 1 python -m venv ".venv-local"
   if errorlevel 1 goto python_fail
 )
-".venv-local\Scripts\python.exe" -c "import openai,httpx,numpy,sklearn,fastapi,uvicorn,multipart,PIL; assert int(openai.__version__.split('.')[0]) == 1" >nul 2>nul
-if errorlevel 1 (
-  echo Installing project dependencies...
-  ".venv-local\Scripts\python.exe" -m pip install -r requirements.txt
-  if errorlevel 1 goto pip_fail
-)
+".venv-local\Scripts\python.exe" -m pip install -r requirements-local-lock.txt
+if errorlevel 1 goto pip_fail
 ".venv-local\Scripts\python.exe" quick_start.py
 if errorlevel 1 (
   echo.
@@ -25,7 +21,7 @@ if errorlevel 1 (
 goto finish
 :python_fail
 echo ERROR: Python 3 not found or virtual environment could not be created.
-echo Install Python 3.10 or later and enable PATH, then rerun 00_START.bat.
+echo Install Python 3.13 and enable PATH, then rerun 00_START.bat.
 goto finish
 :pip_fail
 echo ERROR: Dependency installation failed. Check internet access and pip.

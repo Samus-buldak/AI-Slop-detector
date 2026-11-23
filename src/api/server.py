@@ -5,8 +5,8 @@ from fastapi import FastAPI, HTTPException, Request
 from starlette.datastructures import UploadFile
 from starlette.concurrency import run_in_threadpool
 
-from analyze import score_email
-from config import API_KEY, MODEL_DIR
+from src.core.analyze import score_email
+from src.utils.config import API_KEY, MODEL_DIR
 
 app = FastAPI(title='Kirusha AI Email Detector', version='2.0')
 MAX_EMAIL_BYTES = 5 * 1024 * 1024

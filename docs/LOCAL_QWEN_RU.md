@@ -1,4 +1,4 @@
-> **Архивная инструкция для v1.** Для новой v2-модели (Qwen + PCA + контекст + отдельная LLM-ветка) см. [README_V2_RU.md](README_V2_RU.md). Новые веса сохраняются в `model_hybrid_qwen/`.
+> **Архивная инструкция для v1.** Для новой v2-модели (Qwen + PCA + контекст + отдельная LLM-ветка) см. [README_V2_RU.md](README_V2_RU.md). Новые веса сохраняются в `artifacts/model_hybrid_qwen/`.
 
 # Проект с нуля и локальный Qwen
 
@@ -84,7 +84,7 @@ Qwen уже обучен разработчиками. Мы **не дообуч�
 - Для обращения используется постоянный идентификатор `qwen3-embedding-local`.
 - Локальный запуск задаёт адрес и условный ключ `lm-studio` только своему процессу;
   исходный `.env` не изменяется. Платный ключ для этого локального сервера не нужен.
-- Результаты локального обучения находятся в `model_local_qwen`, прежние — в `model`.
+- Результаты локального обучения находятся в `artifacts/model_local_qwen`, прежние — в `model`.
   Ответы эмбеддингов кэшируются в SQLite, чтобы повторно не считать одинаковый текст.
 - Обнаружена RTX 4090 Laptop с 16 ГБ VRAM. Для выбранной модели этого достаточно.
 
@@ -107,22 +107,22 @@ Qwen уже обучен разработчиками. Мы **не дообуч�
 
 ```powershell
 cd C:\Users\Colorful\projects\Kirusha_AI_Email_Detector
-.\.venv-local\Scripts\python.exe local_qwen.py check
-.\.venv-local\Scripts\python.exe local_qwen.py train
-.\.venv-local\Scripts\python.exe local_qwen.py text
-.\.venv-local\Scripts\python.exe local_qwen.py text "C:\path\message.txt"
-.\.venv-local\Scripts\python.exe local_qwen.py analyze "C:\path\message.eml" --json
-.\.venv-local\Scripts\python.exe local_qwen.py server
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen check
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen train
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen text
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen text "C:\path\message.txt"
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen analyze "C:\path\message.eml" --json
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen server
 ```
 
-Обычный `python analyze.py` использует старую конфигурацию `.env` и папку `model`.
+Обычный `python -m src.core.analyze` использует старую конфигурацию `.env` и папку `model`.
 Для подготовленного локального варианта используй именно `local_qwen.py` или новые BAT.
 Первые два BAT проекта относятся к прежнему процессу подготовки и обучения.
 
 ## Как убедиться, что подключение реально работает
 
 - Проверка пишет `OK: local Qwen embeddings, 1024 dimensions`.
-- В `model_local_qwen/centroids.json`: `backend` равен `api`, `model` равен
+- В `artifacts/model_local_qwen/centroids.json`: `backend` равен `api`, `model` равен
   `qwen3-embedding-local`, есть непустые векторы центроидов.
 - При проверке письма для поддерживаемых частей в `EMBED` стоят числа.
 - `semantic_llm` пустой — это ожидаемо, разговорная модель выключена.
@@ -171,7 +171,7 @@ LM Studio и файлы проекта. Из папки проекта:
 py -3.12 -m venv .venv-local
 .\.venv-local\Scripts\python.exe -m pip install -r requirements-local-lock.txt
 lms get https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF@Q8_0 -y
-.\.venv-local\Scripts\python.exe local_qwen.py train
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen train
 ```
 
 Если LM Studio включает обязательную авторизацию, текущий условный ключ не подойдёт:

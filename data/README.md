@@ -14,7 +14,7 @@
 Команды:
 
 ```sh
-python train.py --csv data/demo_synthetic.csv --offline  # демо офлайн
+python -m src.core.train --csv data/demo_synthetic.csv  # с настроенным Qwen и отдельным DETECTOR_MODEL_DIR
 python train.py --csv data/demo_synthetic.csv            # демо с API, если ключ установлен
 python train.py                                           # ваш реальный data/dataset.csv
 ```

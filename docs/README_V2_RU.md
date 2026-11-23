@@ -2,7 +2,7 @@
 
 ## Главное, что изменилось
 
-Теперь базовый детектор не нуждается в TF-IDF. Для **текста письма целиком** и отдельно для `subject`, `greeting`, `body`, `signature` берётся настоящая векторная репрезентация из установленного локально Qwen3 Embedding 0.6B (LM Studio, 1024 измерения). Длинные тексты разбиваются на перекрывающиеся фрагменты по ~3000 символов, эмбеддинги усредняются и нормируются. Это предотвращает потерю конца больших писем из-за лимита одного запроса. Ответы кэшируются по тексту/версии/модели.
+Для **текста письма целиком** и отдельно для `subject`, `greeting`, `body`, `signature` берётся настоящая векторная репрезентация из установленного локально Qwen3 Embedding 0.6B (LM Studio, 1024 измерения). Длинные тексты разбиваются на перекрывающиеся фрагменты по ~3000 символов, эмбеддинги усредняются и нормируются. Это предотвращает потерю конца больших писем из-за лимита одного запроса. Ответы кэшируются по тексту/версии/модели.
 
 По размеченным **base**-примерам создаются средние нормализованные векторы AI и HUMAN для каждой зоны, а также для письма целиком; только **base** используется для подгонки PCA-проекции полного письма на 8 компонент. Дерево получает косинусное сходство с центрами и восемь PCA-признаков настоящих Qwen-векторов — **не фиктивные hash-эмбеддинги**.
 
@@ -30,11 +30,11 @@
 
 ```powershell
 # Находясь в корне проекта
-.\.venv-local\Scripts\python.exe local_qwen.py check
-.\.venv-local\Scripts\python.exe local_qwen.py train
-.\.venv-local\Scripts\python.exe local_qwen.py text
-.\.venv-local\Scripts\python.exe local_qwen.py analyze "letter.eml" --json
-.\.venv-local\Scripts\python.exe local_qwen.py server
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen check
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen train
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen text
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen analyze "letter.eml" --json
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen server
 ```
 
 Или нажимай `03`, `04`, `05`, `06` BAT-файлы. Само обучение проводится **один раз на датасете** и повторяется после изменения данных/модели. Для каждого нового текста переобучение не требуется.
@@ -48,10 +48,10 @@
 Эквивалентные команды:
 
 ```powershell
-.\.venv-local\Scripts\python.exe local_qwen.py train --llm-from-env --with-llm
-.\.venv-local\Scripts\python.exe local_qwen.py text --llm-from-env
-.\.venv-local\Scripts\python.exe local_qwen.py analyze --llm-from-env "letter.eml" --json
-.\.venv-local\Scripts\python.exe local_qwen.py server --llm-from-env
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen train --llm-from-env --with-llm
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen text --llm-from-env
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen analyze --llm-from-env "letter.eml" --json
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen server --llm-from-env
 ```
 
 На обучении будут созданы `no_llm` и `with_llm` деревья. При обычном запуске `05_LOCAL_QWEN_TEXT.bat` LLM-ветка не включится, но `no_llm` дерево продолжит работать. Если провайдер не отвечает или хотя бы одна непустая зона не получила оценку, автоматически используется `no_llm`. Чтобы изменить конфигурацию/модель LLM и сохранить корректность `with_llm`, переобучи детектор. Модель по умолчанию не обучается заново при каждом письме.
@@ -62,30 +62,16 @@
 2. Запусти `07_LOCAL_QWEN_TRAIN_WITH_LLM.bat`, укажи ID. Или:
 
 ```powershell
-.\.venv-local\Scripts\python.exe local_qwen.py train --llm-model "ТОЧНЫЙ_ID_CHAT_МОДЕЛИ" --with-llm
-.\.venv-local\Scripts\python.exe local_qwen.py text --llm-model "ТОЧНЫЙ_ID_CHAT_МОДЕЛИ"
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen train --llm-model "ТОЧНЫЙ_ID_CHAT_МОДЕЛИ" --with-llm
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen text --llm-model "ТОЧНЫЙ_ID_CHAT_МОДЕЛИ"
 ```
 
 При проверке/серверном запуске используй **тот же ID**, иначе детектор честно перейдёт на `no_llm`. При желании задай `LOCAL_LLM_MODEL` в терминале для этой сессии (PowerShell `$env:LOCAL_LLM_MODEL="..."`). Для сервера:
 
 ```powershell
-.\.venv-local\Scripts\python.exe local_qwen.py server --llm-model "ТОЧНЫЙ_ID_CHAT_МОДЕЛИ"
+.\.venv-local\Scripts\python.exe -m src.api.local_qwen server --llm-model "ТОЧНЫЙ_ID_CHAT_МОДЕЛИ"
 ```
 
-**Включить TF-IDF для сравнения** (по умолчанию выключен):
-
-```powershell
-.\.venv-local\Scripts\python.exe local_qwen.py train --use-tfidf
-```
-
-Есть отдельный `08_LOCAL_QWEN_TRAIN_WITH_TFIDF.bat`. Он **переобучит** новую v2 модель в той же папке и перезапишет результаты; если хочешь честно сравнить две версии, сначала сохрани копию `model_hybrid_qwen/`.
-
-Обучить TF-IDF-режим без Qwen, если локальный сервер недоступен (только отладка):
-
-```powershell
-$env:DETECTOR_MODEL_DIR="model_offline_test"
-python train.py --offline --use-tfidf
-```
 
 ## Файлы и модель
 
@@ -102,9 +88,9 @@ python train.py --offline --use-tfidf
 | `local_qwen.py` | локальные Qwen-эмбеддинги и явный выбор chat-провайдера (`--llm-from-env` либо `--llm-model`) |
 | `server.py` | `POST /analyze`, `GET /health`; API-документация `/docs` |
 
-Новые веса/пороги/отчёт: `model_hybrid_qwen/tree.pkl`, `centroids.json`, `thresholds.json`, `test_metrics.json`. Эти четыре артефакта нужны для готового инференса и могут храниться в Git; SQLite-кэш и виртуальное окружение в Git не добавляются. При стандартном Qwen-only обучении `tfidf.pkl` не создаётся: TF-IDF — отдельный необязательный baseline, а не часть Qwen-эмбеддингов. Загрузчик v2 принимает отсутствие `tfidf.pkl`; старые v1-модели с TF-IDF сохраняют обратную совместимость.
+Новые веса/пороги/отчёт: `artifacts/model_hybrid_qwen/tree.pkl`, `centroids.json`, `thresholds.json`, `test_metrics.json`. Эти четыре артефакта нужны для готового инференса и могут храниться в Git; SQLite-кэш и виртуальное окружение в Git не добавляются. Новые деревья используют 141 вход. Сохранённые Qwen-деревья с 73 или 77 входами работают по прежней четырёхзонной схеме.
 
-**Важно**: нельзя считать старую `model_local_qwen` новой v2. После распаковки **запусти обучение заново** в `model_hybrid_qwen`. Архив не содержит ни новых обученных весов дерева, ни локально скачанной модели Qwen. Оригинальные артефакты v1 для совместимости остаются на месте.
+**Важно**: нельзя считать старую `artifacts/model_local_qwen` новой v2. После распаковки **запусти обучение заново** в `artifacts/model_hybrid_qwen`. Архив не содержит ни новых обученных весов дерева, ни локально скачанной модели Qwen. Оригинальные артефакты v1 для совместимости остаются на месте.
 
 ## Ограничения
 
@@ -116,3 +102,27 @@ python train.py --offline --use-tfidf
 - Для LLM нет гарантии корректности ответа: JSON и диапазон проверяются, ошибки не кладутся в кэш. Содержимое писем передаётся модели как недоверенные данные, но полной защиты от prompt injection нет.
 - Если поменял Qwen, версию, ID, сегментацию, обучай **все артефакты v2 заново**.
 - `pickle` требует доверенного происхождения файлов; не загружай веса моделей от неизвестных людей.
+
+### Очистка HTML и цитат
+
+HTML разбирается локально в видимый текст. Вложения, скрытые элементы и распознанные HTML-цитаты исключаются из авторских зон. Эвристика также убирает размеченные текстовые цитаты и историю пересылок. В LLM-режиме модель дополнительно размечает по номерам строк неявные цитаты и границы приветствия и подписи. При ошибке ответа или превышении лимита длины остаётся эвристическая сегментация.
+
+Для модели, ранее обученной без LLM-сегментации, можно явно включить очистку при анализе:
+
+```sh
+python -m src.api.local_qwen analyze --llm-from-env --llm-cleanup letter.eml --json
+```
+
+С `--llm-from-env` видимые строки, оставшиеся после предварительной очистки, передаются chat-провайдеру из `.env`. Для одинаковой обработки при обучении и анализе используется `train --with-llm --llm-segmentation` с выбранным chat-провайдером. Контекстные признаки стиля считаются по очищенным зонам, а признаки переписки — по исходным структурным маркерам видимого письма.
+
+### Дополнительные сегменты Qwen
+
+После очистки письма добавляются вступление, основная часть, заключение, списки и постскриптум. Вступление и заключение выбираются по положению текстовых абзацев. Короткое письмо может содержать только основную часть.
+
+Qwen отдельно оценивает первые пять абзацев и помещает оставшиеся в шестой вход. При включённой LLM-сегментации Qwen также получает до шести смысловых блоков. Границы определяет LLM. При переходе на эвристику доступны структурные зоны и абзацы.
+
+Полный текст, исходные четыре зоны и дополнительные сегменты идут в Qwen. Контекстные признаки и средняя оценка зон используют только исходные четыре зоны, чтобы не считать один текст дважды. Сегменты видны в CLI и JSON после обучения новых весов. Для обучения со смысловыми блоками:
+
+```sh
+python -m src.api.local_qwen train --llm-from-env --with-llm --llm-segmentation
+```
