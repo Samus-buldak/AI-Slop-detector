@@ -65,6 +65,12 @@ def main() -> None:
     print("\n--- РЕЗУЛЬТАТ ---")
     print(f"Объём: {len(text.split())} слов")
     print(f"Режим: {result.get('mode', 'нет')}; эмбеддинги: {result.get('embedding_backend', 'нет')}")
+    print('Выделенные части письма:')
+    for kind in ('subject', 'greeting', 'body', 'signature'):
+        segment = result.get('segments', {}).get(kind, {})
+        if segment.get('present'):
+            preview = ' '.join(segment.get('text_preview', '').split())
+            print(f"  {RU[kind]}: {preview[:220]}")
     print(f"{'Сегмент':<17}{'EMBED':>9}{'LLM':>9}{'SCORE':>9}{'ПОРОГ':>9}  Метка")
     for kind, item in result['segments'].items():
         if not item['present']:
@@ -84,6 +90,23 @@ def main() -> None:
     print('Сегментация:', result.get('segmentation_method', 'rules'))
     print(f"Итоговый скор: {result.get('final_score', '—')}")
     print(f"ВЕРДИКТ: {result['verdict']}")
+    path = result.get('tree_decision_path') or []
+    if path:
+        print('Путь дерева:')
+        for step in path:
+            print('  -', step.get('condition', step.get('feature')))
+    evidence = result.get('textual_evidence', {}).get('items', [])
+    print('Локально найденные текстовые маркеры:')
+    if not evidence:
+        print('  - Не найдены.')
+    for item in evidence:
+        used = 'участвовал в пути дерева' if item.get('used_by_tree') else 'обнаружен, но не использован в пути дерева'
+        print(f"  - [{RU.get(item['zone'], item['zone'])}] «{item['phrase']}» — {item['explanation']} ({used})")
+    llm_evidence = result.get('llm_textual_evidence', {})
+    if llm_evidence.get('status') == 'ok':
+        print('Пояснение chat-модели (дополнительное, не меняет вердикт):', llm_evidence.get('summary') or '—')
+        for item in llm_evidence.get('items', []):
+            print(f"  - [{RU.get(item['zone'], item['zone'])}] «{item['quote']}» — {item['reason']}")
     for warning in result.get('warnings', []):
         print("ВНИМАНИЕ:", warning)
     print("Важно: это экспериментальный детектор писем, а не доказательство авторства.")

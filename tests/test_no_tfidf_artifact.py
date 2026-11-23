@@ -3,7 +3,7 @@ import json
 import pickle
 
 from src.core import analyze
-from src.core.scoring import v2_feature_names
+from src.core.scoring import legacy_v2_feature_names, v2_feature_names
 from src.api import server
 
 
@@ -37,3 +37,30 @@ def test_manual_email_input_is_single_line(monkeypatch, capsys):
     monkeypatch.setattr(builtins, "input", lambda: message)
     assert get_text(None) == message
     assert "одной строкой" in capsys.readouterr().out
+
+
+def test_pre_lexical_77_feature_qwen_model_remains_loadable(monkeypatch, tmp_path):
+    import numpy as np
+    from sklearn.tree import DecisionTreeClassifier
+
+    tree = DecisionTreeClassifier(max_depth=1, random_state=1).fit(
+        np.asarray([[0.] * 77, [1.] * 77]), np.asarray([0, 1]))
+    (tmp_path / "tree.pkl").write_bytes(pickle.dumps({"no_llm": tree}))
+    (tmp_path / "thresholds.json").write_text(json.dumps({
+        "schema_version": 2,
+        "feature_names": legacy_v2_feature_names(include_tfidf=True),
+    }), encoding="utf-8")
+    (tmp_path / "centroids.json").write_text(json.dumps({"backend": "api"}), encoding="utf-8")
+    monkeypatch.setattr(analyze, "MODEL_DIR", tmp_path)
+    analyze.load_model.cache_clear()
+    try:
+        loaded, thresholds, _ = analyze.load_model()
+        assert loaded["no_llm"].n_features_in_ == 77
+        assert len(thresholds["feature_names"]) == 77
+    finally:
+        analyze.load_model.cache_clear()
+
+
+def test_legacy_feature_layouts_match_original_dimensions():
+    assert len(legacy_v2_feature_names()) == 73
+    assert len(legacy_v2_feature_names(include_tfidf=True)) == 77

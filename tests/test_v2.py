@@ -194,7 +194,7 @@ def test_additional_qwen_zones_leave_context_and_base_features_intact(monkeypatc
     assert old['context'] == new['context']
     assert old['features_no_llm'] == new['features_no_llm'][:len(v2_feature_names())]
     names = v2_feature_names(extra_segments=True)
-    assert len(names) == len(new['features_no_llm']) == 141
+    assert len(names) == len(new['features_no_llm']) == 157
     assert new['features_no_llm'][names.index('introduction_embedding')] > .5
 
 

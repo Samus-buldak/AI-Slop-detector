@@ -11,7 +11,7 @@ from src.segmentation.segments import KINDS, document_text, split_email
 from src.segmentation.qwen_zones import QWEN_KINDS, expand_qwen_zones
 
 
-def collect_rows(rows, centroids, cache, with_llm=False, verbose=False, zone_overrides=None, *, extra_segments=False):
+def collect_rows(rows, centroids, cache, with_llm=False, verbose=False, zone_overrides=None, *, extra_segments=False, strict_embeddings=False, strict_semantic=False):
     """Rows are (subject, original_body, label). Work is batched and cached."""
     segments = ([zone_overrides[i] if zone_overrides[i] is not None else split_email(subject, body)
                  for i, (subject, body, _) in enumerate(rows)] if zone_overrides is not None else
@@ -21,9 +21,12 @@ def collect_rows(rows, centroids, cache, with_llm=False, verbose=False, zone_ove
         segments = [expand_qwen_zones(zones) for zones in segments]
     want_embed = centroids['backend'] == 'api'
     if with_llm:
+        api_kwargs = {'cache': cache, 'verbose': verbose}
+        if strict_semantic:
+            api_kwargs['strict_semantic'] = True
         _, semantics = asyncio.run(api_signals(
-            [{kind: zones[kind] for kind in KINDS} for zones in segments], want_embedding=False, want_semantic=True,
-            cache=cache, verbose=verbose))
+            [{kind: zones[kind] for kind in KINDS} for zones in segments],
+            want_embedding=False, want_semantic=True, **api_kwargs))
     else:
         semantics = {}
 
@@ -34,11 +37,22 @@ def collect_rows(rows, centroids, cache, with_llm=False, verbose=False, zone_ove
                                       for kind in kinds if zones[kind].strip()))
         doc_texts = [document_text(zones) for zones in segments]
         inputs = [text for kind, text in zone_keys] + doc_texts
-        vectors = embedding_vectors(inputs, cache=cache, verbose=verbose)
+        vectors = embedding_vectors(inputs, cache=cache, verbose=verbose, strict=strict_embeddings)
         embeddings = dict(zip(zone_keys, vectors[:len(zone_keys)]))
         doc_vecs = vectors[len(zone_keys):]
 
     centers = centroids['centroids']
+    if strict_embeddings:
+        expected_dim = int(centroids.get('dimension') or 0)
+        invalid = [kind for (kind, _text), vector in embeddings.items()
+                   if vector is not None and expected_dim and len(vector) != expected_dim]
+        invalid_docs = [i for i, vector in enumerate(doc_vecs)
+                        if vector is None or (expected_dim and len(vector) != expected_dim)]
+        if invalid:
+            raise RuntimeError('Embedding dimensions changed during training for: ' + ', '.join(sorted(set(invalid))))
+        if invalid_docs:
+            raise RuntimeError('Missing or dimension-mismatched full-document embeddings for row(s): ' +
+                               ', '.join(map(str, invalid_docs[:10])))
     result = []
     for i, ((_, original_body, label), zones) in enumerate(zip(rows, segments)):
         emb_probs, sem_probs, similarities = {}, {}, {}

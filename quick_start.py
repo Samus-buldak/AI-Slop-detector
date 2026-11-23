@@ -10,8 +10,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from src.api.local_qwen import MODEL_FOLDER
+from src.api.local_qwen import LOCAL_ENDPOINT, MODEL_FOLDER
 from src.core.scoring import v2_feature_names
+from src.segmentation.segments import RULES_VERSION
+from src.segmentation.segmentation_llm import PROMPT_VERSION
 
 ROOT = Path(__file__).resolve().parent
 PYTHON = sys.executable
@@ -95,11 +97,35 @@ def is_new_model_ready():
                 not settings.get('use_tfidf') and
                 settings.get('with_llm_trained') is True and
                 settings.get('llm_segmentation') is True and
+                settings.get('segmentation_version') == PROMPT_VERSION and
                 settings.get('feature_names') == v2_feature_names(extra_segments=True) and
                 centroids.get('backend') == 'api' and
                 centroids.get('model') == 'qwen3-embedding-local')
     except (OSError, ValueError, TypeError):
         return False
+
+
+
+def _normalise_endpoint(value):
+    return str(value or '').strip().rstrip('/')
+
+
+def matching_chat_args(settings):
+    """Return args for exactly the chat provider used during training.
+
+    None means the saved chat model/endpoint cannot be recreated safely.
+    """
+    model = str(settings.get('llm_model') or '').strip()
+    endpoint = _normalise_endpoint(settings.get('llm_endpoint'))
+    if not model or not endpoint:
+        return None
+    if endpoint == _normalise_endpoint(LOCAL_ENDPOINT):
+        return ['--llm-model', model]
+    values = load_config()
+    if (configured(values) and values.get('MODEL', '').strip() == model and
+            _normalise_endpoint(values.get('API_URL')) == endpoint):
+        return ['--llm-from-env']
+    return None
 
 
 def main():
@@ -137,14 +163,28 @@ def main():
         return 5
     settings = json.loads(TRAINED.read_text(encoding='utf-8'))
     extra_zones = settings.get('feature_names') == v2_feature_names(extra_segments=True)
-    print('Модель использует', '21 зону.' if extra_zones else '4 зоны. Для 21 зоны выбери обучение при запуске.')
+    print('Модель использует', 'расширенные 21 аналитическую зону.' if extra_zones else '4 структурные зоны. Для расширенной схемы выбери обучение при запуске.')
+    expected_version = PROMPT_VERSION if settings.get('llm_segmentation') else RULES_VERSION
+    if settings.get('segmentation_version') != expected_version:
+        print('[!] Сохранённые веса обучены с другой версией сегментации. Анализ будет UNCERTAIN до переобучения.')
     provider_args = []
     if settings.get('llm_segmentation'):
-        if not configure_env():
+        if _normalise_endpoint(settings.get('llm_endpoint')) != _normalise_endpoint(LOCAL_ENDPOINT):
+            if not configure_env():
+                return 2
+        provider_args = matching_chat_args(settings)
+        if provider_args is None:
+            print('[!] Не совпадает chat-модель или endpoint с теми, на которых обучалась сегментация.')
+            print('Восстанови исходные API_URL/MODEL в .env или загрузи прежнюю chat-модель в LM Studio.')
             return 2
-        provider_args = ['--llm-from-env']
+    elif settings.get('with_llm_trained'):
+        matching_args = matching_chat_args(settings)
+        if matching_args is None:
+            print('[!] Chat-модель/endpoint отличаются от обучающих; будет использована независимая ветка no_llm.')
+        elif ask('Включить chat-модель, совпадающую с обучением? [д/Н]: ', 'н').lower() in ('д', 'y', 'yes', 'да'):
+            provider_args = matching_args
     elif configured(load_config()):
-        print('В .env настроен chat-провайдер. Его включение передаёт ему части писем.')
+        print('В .env настроен chat-провайдер. Он может использоваться для пояснений/vision, но не меняет классификацию no_llm.')
         if ask('Включить chat/vision из .env? [д/Н]: ', 'н').lower() in ('д', 'y', 'yes', 'да'):
             provider_args = ['--llm-from-env']
     print('\nАнализ готов. Для выхода выбери 0.')

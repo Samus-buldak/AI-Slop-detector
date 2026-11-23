@@ -4,11 +4,11 @@ set PYTHONUTF8=1
 cd /d "%~dp0.."
 echo Run LM Studio. Load TWO models: qwen3-embedding-local AND your chat Qwen model.
 echo Find the exact chat model identifier in LM Studio's Models screen.
-set /p LOCAL_LLM_MODEL="Chat model identifier (e.g. qwen3-4b-instruct): "
+set /p LOCAL_LLM_MODEL="Chat model identifier (exact ID from LM Studio): "
 if "%LOCAL_LLM_MODEL%"=="" (
   echo No chat model ID supplied. Training cancelled.
   pause
   exit /b 1
 )
-".venv-local\Scripts\python.exe" -m src.api.local_qwen train --with-llm
+".venv-local\Scripts\python.exe" -m src.api.local_qwen train --llm-model "%LOCAL_LLM_MODEL%" --with-llm --llm-segmentation
 pause

@@ -46,7 +46,7 @@ def _unit_mean(vectors):
     return [x / norm for x in avg] if norm > 0 else None
 
 
-def embedding_vectors(texts, cache=None, verbose=False):
+def embedding_vectors(texts, cache=None, verbose=False, *, strict=False):
     """Returns one unit vector per input. No fabricated fallback for failures."""
     indices, flat = [], []
     for text in texts:
@@ -55,7 +55,12 @@ def embedding_vectors(texts, cache=None, verbose=False):
         flat.extend(parts)
     if not flat:
         return [None] * len(texts)
-    vectors = asyncio.run(embedding_many(flat, cache=cache, verbose=verbose))
+    if strict:
+        vectors = asyncio.run(embedding_many(flat, cache=cache, verbose=verbose, strict=True))
+    else:
+        # Keep compatibility with injected embedding providers that implement
+        # the original non-strict call signature.
+        vectors = asyncio.run(embedding_many(flat, cache=cache, verbose=verbose))
     return [_unit_mean(vectors[a:b]) for a, b in indices]
 
 

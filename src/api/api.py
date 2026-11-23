@@ -34,7 +34,15 @@ class SignalCache:
 
     def get(self, key):
         row = self.db.execute('SELECT value FROM signals WHERE key=?', (key,)).fetchone()
-        return json.loads(row[0]) if row else None
+        if not row:
+            return None
+        try:
+            return json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            # A truncated or manually edited cache row is a cache miss, not a
+            # reason to abort model training or analysis.
+            self.delete(key)
+            return None
 
     def set(self, key, value):
         if value is None:
@@ -45,6 +53,10 @@ class SignalCache:
         if self.pending >= 50:
             self.db.commit()
             self.pending = 0
+
+    def delete(self, key):
+        self.db.execute('DELETE FROM signals WHERE key=?', (key,))
+        self.pending += 1
 
     def close(self):
         self.db.commit()
@@ -179,12 +191,15 @@ async def _emb_chunk(client, texts):
     return ordered
 
 
-async def _many(items, task, cache=None, client=None, verbose=False):
+async def _many(items, task, cache=None, client=None, verbose=False, *, strict=False):
     """Фиксированное число воркеров, не тысячи tasks; нет вложенного semaphore."""
     if not items:
         return [None] * len(items)
     is_sem = task == 'semantic'
-    if not (SEMANTIC_API_KEY if is_sem else API_KEY):
+    token = SEMANTIC_API_KEY if is_sem else API_KEY
+    if not token:
+        if strict:
+            raise RuntimeError(f'{task} API key is not configured')
         return [None] * len(items)
     batch = SEM_BATCH if is_sem else EMB_BATCH
     parallel = SEM_CONC if is_sem else EMB_CONC
@@ -200,6 +215,18 @@ async def _many(items, task, cache=None, client=None, verbose=False):
     missing = []
     for key, data in jobs.items():
         value = cache.get(key) if cache is not None else None
+        if value is not None:
+            if is_sem:
+                valid_cache = (isinstance(value, (int, float)) and
+                               not isinstance(value, bool) and math.isfinite(value) and
+                               0 <= value <= 1)
+            else:
+                value = _normalise_vector(value)
+                valid_cache = value is not None
+            if not valid_cache:
+                if cache is not None and hasattr(cache, 'delete'):
+                    cache.delete(key)
+                value = None
         if value is not None:
             for i in data['indices']:
                 result[i] = value
@@ -228,9 +255,29 @@ async def _many(items, task, cache=None, client=None, verbose=False):
                 await process(active_client, chunk[:half])
                 await process(active_client, chunk[half:])
                 return
+            if strict:
+                status = getattr(exc, 'status_code', None)
+                response = getattr(exc, 'response', None)
+                response_text = ''
+                if response is not None:
+                    try:
+                        response_text = response.text[:500]
+                    except Exception:
+                        response_text = ''
+                detail = f'HTTP {status}' if status is not None else type(exc).__name__
+                if response_text:
+                    detail += f': {response_text}'
+                raise RuntimeError(f'{task} API request failed: {detail}') from exc
             if verbose and failed == 0:
-                code = exc.status_code if isinstance(exc, APIStatusError) else type(exc).__name__
-                print(f'[api:{task}] запрос не удался ({code}); пропускаю недоступный сигнал')
+                code = getattr(exc, 'status_code', None) or type(exc).__name__
+                response = getattr(exc, 'response', None)
+                detail = ''
+                if response is not None:
+                    try:
+                        detail = ': ' + response.text[:240]
+                    except Exception:
+                        pass
+                print(f'[api:{task}] запрос не удался ({code}){detail}; пропускаю недоступный сигнал')
             values = [None] * len(chunk)
         for (key, _item, indices), value in zip(chunk, values):
             for i in indices:
@@ -267,15 +314,15 @@ async def _many(items, task, cache=None, client=None, verbose=False):
     return result
 
 
-async def semantic_many(items: list[tuple[str, str]], cache=None, client=None, verbose=False):
-    return await _many(items, 'semantic', cache, client, verbose)
+async def semantic_many(items: list[tuple[str, str]], cache=None, client=None, verbose=False, *, strict=False):
+    return await _many(items, 'semantic', cache, client, verbose, strict=strict)
 
 
-async def embedding_many(texts: list[str], cache=None, client=None, verbose=False):
-    return await _many(texts, 'embedding', cache, client, verbose)
+async def embedding_many(texts: list[str], cache=None, client=None, verbose=False, *, strict=False):
+    return await _many(texts, 'embedding', cache, client, verbose, strict=strict)
 
 
-async def api_signals(segments, want_embedding=True, want_semantic=True, cache=None, verbose=False):
+async def api_signals(segments, want_embedding=True, want_semantic=True, cache=None, verbose=False, *, strict_semantic=False):
     """Оба независимых Qwen endpoint вызываются параллельно через OpenAI SDK."""
     pairs = [(k, seg[k]) for seg in segments for k in ('subject', 'greeting', 'body', 'signature')
              if seg[k].strip()]
@@ -286,7 +333,7 @@ async def api_signals(segments, want_embedding=True, want_semantic=True, cache=N
     async def get_emb():
         return await embedding_many(items, cache, verbose=verbose) if want_embedding else [None] * len(items)
     async def get_sem():
-        return await semantic_many(keys, cache, verbose=verbose) if want_semantic else [None] * len(items)
+        return await semantic_many(keys, cache, verbose=verbose, strict=strict_semantic) if want_semantic else [None] * len(items)
     emb, sem = await asyncio.gather(get_emb(), get_sem())
     return ({key: v for key, v in zip(keys, emb) if v is not None},
             {key: v for key, v in zip(keys, sem) if v is not None})
